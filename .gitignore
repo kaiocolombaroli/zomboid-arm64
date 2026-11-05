@@ -1,0 +1,34 @@
+# Insumos baixados pelo usuario ou gerados: NUNCA versionar (arquivos do jogo, FMOD, JDK, toolchain)
+/game-libs/
+/third-party/
+/dist/
+/build/
+/cache/
+/logs/
+/tools/toolchain/
+/spike-java-arm/jdk-25-arm64/
+/spike-java-arm/_downloads/
+/spike-java-arm/natives-arm64/
+/spike-java-arm/backup/
+/spike-java-arm/cache/
+/spike-java-arm/logs/
+
+# Ferramentas locais, saves, logs, imagens
+/.claude/
+/graphify-out/
+/Zomboid/
+*.jfr
+*.class
+*.jar
+*.dll
+*.dylib
+*.exe
+*.log
+*.png
+*.jpg
+*.pyc
+__pycache__/
+*.zip
+*.bin
+/buildloader_capture.txt
+/buildgarbage.bin

@@ -1,0 +1,10 @@
+# Toolchain file: llvm-mingw (aarch64, ucrt) instalado em tools/toolchain/llvm-mingw.
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR ARM64)
+file(GLOB _lm_dirs "${CMAKE_CURRENT_LIST_DIR}/../tools/toolchain/llvm-mingw/llvm-mingw-*")
+list(GET _lm_dirs 0 _lm)
+set(CMAKE_C_COMPILER   "${_lm}/bin/aarch64-w64-mingw32-clang.exe")
+set(CMAKE_CXX_COMPILER "${_lm}/bin/aarch64-w64-mingw32-clang++.exe")
+set(CMAKE_RC_COMPILER  "${_lm}/bin/aarch64-w64-mingw32-windres.exe")
+set(CMAKE_AR           "${_lm}/bin/llvm-ar.exe" CACHE FILEPATH "")
+set(CMAKE_RANLIB       "${_lm}/bin/llvm-ranlib.exe" CACHE FILEPATH "")
