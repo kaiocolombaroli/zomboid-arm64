@@ -1,4 +1,4 @@
-"""Relatorio de FPS a partir de logs/fps-<arch>-<timestamp>.csv (t_ms,frames,ram_livre_mb).
+"""Relatorio de FPS a partir de logs/fps-<arch>-<timestamp>.csv (t_ms,frames,ram_livre_mb[,max_ms,over33,over50]; linhas # sao comentarios).
 Uso: python tools/fps_report.py [csv ...]   (sem argumentos: logs/fps-*.csv)
 """
 import csv
@@ -13,15 +13,33 @@ WARMUP_S = 30
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _lines(f):
+    """Ignora comentarios (linhas que comecam com #, ex.: tamanho do framebuffer)."""
+    return (ln for ln in f if not ln.startswith("#"))
+
+
 def load_csv(path):
+    """Linhas (t_ms, frames, ram_livre_mb). Aceita o formato antigo (3 colunas) e o novo (max_ms, over33, over50)."""
     with open(path, newline="", encoding="utf-8") as f:
-        return [(int(r["t_ms"]), int(r["frames"]), int(r["ram_livre_mb"])) for r in csv.DictReader(f)]
+        return [(int(r["t_ms"]), int(r["frames"]), int(r["ram_livre_mb"])) for r in csv.DictReader(_lines(f))]
+
+
+def load_csv_full(path):
+    """Como load_csv, mas cada linha traz (t_ms, frames, ram, max_ms, over33, over50); as 3 ultimas sao None no formato antigo."""
+    with open(path, newline="", encoding="utf-8") as f:
+        out = []
+        for r in csv.DictReader(_lines(f)):
+            ex = [int(r[k]) if r.get(k) not in (None, "") else None for k in ("max_ms", "over33", "over50")]
+            out.append((int(r["t_ms"]), int(r["frames"]), int(r["ram_livre_mb"])) + tuple(ex))
+        return out
 
 
 def stats(rows, warmup_s=WARMUP_S):
     """rows: (t_ms, frames no intervalo, ram_livre_mb). Descarta t_ms <= warmup_s*1000."""
     fps, ram, prev = [], [], 0
-    for t, fr, r in rows:
+    mx, o33, o50 = [], [], []
+    for row in rows:
+        t, fr, r = row[:3]
         dt = t - prev
         prev = t
         if t <= warmup_s * 1000 or dt <= 0:
@@ -29,6 +47,13 @@ def stats(rows, warmup_s=WARMUP_S):
         fps.append(fr * 1000.0 / dt)
         if r >= 0:
             ram.append(r)
+        if len(row) >= 6:
+            if row[3] is not None:
+                mx.append(row[3])
+            if row[4] is not None:
+                o33.append(row[4])
+            if row[5] is not None:
+                o50.append(row[5])
     if not fps:
         return None
     low = sorted(fps)[:max(1, math.ceil(len(fps) / 100))]
@@ -36,6 +61,7 @@ def stats(rows, warmup_s=WARMUP_S):
     warn = [v for v in (60, 30) if abs(mean - v) <= 0.02 * v]
     return {"n": len(fps), "mean": mean, "median": statistics.median(fps), "low1": statistics.fmean(low),
             "ram_min": min(ram) if ram else None,
+            "max_ms": max(mx) if mx else None, "over33": sum(o33) if o33 else None, "over50": sum(o50) if o50 else None,
             "warning": ("media perto de %d FPS: possivel vsync ligado, resultado suspeito" % warn[0]) if warn else None}
 
 
@@ -52,13 +78,15 @@ def main(argv):
     print("%-34s %6s %8s %8s %8s %8s" % ("arquivo", "n", "media", "mediana", "1%baixo", "RAM min"))
     by_arch = {}
     for p in files:
-        s = stats(load_csv(p))
+        s = stats(load_csv_full(p))
         if not s:
             print("%-34s sem dados apos %ds de aquecimento" % (os.path.basename(p), WARMUP_S))
             continue
         by_arch.setdefault(arch_of(p), []).append(s)
         print("%-34s %6d %8.1f %8.1f %8.1f %8s" % (os.path.basename(p), s["n"], s["mean"], s["median"], s["low1"],
                                                    "-" if s["ram_min"] is None else "%d MB" % s["ram_min"]))
+        if s["max_ms"] is not None:
+            print("  pior intervalo entre quadros: %d ms; quadros > 33 ms: %d; > 50 ms: %d" % (s["max_ms"], s["over33"], s["over50"]))
         if s["warning"]:
             print("  AVISO: " + s["warning"])
     means = {a: statistics.fmean(s["mean"] for s in v) for a, v in by_arch.items()}

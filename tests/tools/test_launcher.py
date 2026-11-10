@@ -134,19 +134,21 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(m, c)
         return m.group(1)
 
-    def test_default_is_fbo_flushtex_collapse(self):
+    def test_default_is_fbo_glsync_collapse(self):
         r = self.run_launcher()
         a = self.agent_arg(self.cmdline(r))
         self.assertIn(",pz=PerformanceSettings.fboRenderChunk=true", a)
-        self.assertTrue(a.endswith(",renderfix=flushtex,collapse=player"), a)
+        self.assertTrue(a.endswith(",collapse=player,vbosync=sync,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
+        self.assertNotIn("renderfix", a)
+        self.assertIn(",vbosync=sync", a)
         self.assertIn("fboRenderChunk efetivo: true (origem: padrao)", r.stdout)
-        self.assertIn("renderfix efetivo: flushtex (origem: padrao do modo FBO)", r.stdout)
+        self.assertIn("renderfix efetivo: nenhum (origem: padrao do modo FBO)", r.stdout)
         self.assertIn("collapse efetivo: player (origem: padrao do modo FBO)", r.stdout)
 
     def test_no_fbo_chunk_restores_old_path(self):
         r = self.run_launcher("-NoFboChunk")
         a = self.agent_arg(self.cmdline(r))
-        self.assertTrue(a.endswith(",pz=PerformanceSettings.fboRenderChunk=false"), a)
+        self.assertTrue(a.endswith(",pz=PerformanceSettings.fboRenderChunk=false,vbosync=sync,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
         self.assertNotIn("renderfix", a)
         self.assertNotIn("collapse", a)
         self.assertIn("fboRenderChunk efetivo: false (origem: opcao -NoFboChunk)", r.stdout)
@@ -169,16 +171,16 @@ class LauncherTests(unittest.TestCase):
     def test_no_collapse_fix(self):
         r = self.run_launcher("-NoCollapseFix")
         a = self.agent_arg(self.cmdline(r))
-        self.assertTrue(a.endswith(",renderfix=flushtex"), a)
+        self.assertTrue(a.endswith(",vbosync=sync,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
         self.assertNotIn("collapse", a)
         self.assertIn("collapse efetivo: nenhum (origem: opcao -NoCollapseFix)", r.stdout)
-        self.assertIn("renderfix efetivo: flushtex (origem: padrao do modo FBO)", r.stdout)
+        self.assertIn("renderfix efetivo: nenhum (origem: padrao do modo FBO)", r.stdout)
 
     def test_render_fix_none_and_override(self):
         r = self.run_launcher("-RenderFix", "none")
         a = self.agent_arg(self.cmdline(r))
         self.assertNotIn("renderfix", a)
-        self.assertTrue(a.endswith(",collapse=player"), a)
+        self.assertTrue(a.endswith(",collapse=player,vbosync=sync,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
         self.assertIn("renderfix efetivo: nenhum (origem: opcao -RenderFix none)", r.stdout)
         r = self.run_launcher("-RenderFix", "flushchunk")
         a = self.agent_arg(self.cmdline(r))
@@ -212,7 +214,7 @@ class LauncherTests(unittest.TestCase):
         r = self.run_launcher("-PzSet", "PerformanceSettings.fboRenderChunk=true")
         a = self.agent_arg(self.cmdline(r))
         self.assertEqual(a.count("fboRenderChunk"), 1)
-        self.assertTrue(a.endswith(",renderfix=flushtex,collapse=player"), a)
+        self.assertTrue(a.endswith(",collapse=player,vbosync=sync,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
         self.assertIn("fboRenderChunk efetivo: true (origem: -PzSet explicito)", r.stdout)
 
     def test_noagent_header_not_applicable(self):
@@ -221,12 +223,244 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("fboRenderChunk efetivo: nao aplicavel", r.stdout)
         self.assertIn("renderfix efetivo: nao aplicavel", r.stdout)
         self.assertIn("collapse efetivo: nao aplicavel", r.stdout)
+        self.assertIn("vbosync efetivo: nao aplicavel (-NoAgent)", r.stdout)
         self.cmdline(self.run_launcher("-NoAgent", "-NoFboChunk"))
         self.assertEqual(self.run_launcher("-NoAgent", "-NoCollapseFix").returncode, 2)
 
+    def test_vbosync_default_sync_in_both_modes(self):
+        for extra in ([], ["-NoFboChunk"]):
+            r = self.run_launcher(*extra)
+            a = self.agent_arg(self.cmdline(r))
+            self.assertEqual(a.count("vbosync=sync"), 1)
+            self.assertIn("vbosync efetivo: sync (origem: padrao)", r.stdout)
+
+    def test_new_defaults_glsync_swapfence_in_both_modes(self):
+        for extra in ([], ["-NoFboChunk"]):
+            r = self.run_launcher(*extra)
+            a = self.agent_arg(self.cmdline(r))
+            self.assertTrue(a.endswith(",glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
+            self.assertEqual(a.count("glsync"), 3)
+            self.assertNotIn("swapfinish", a)
+            self.assertNotIn("renderfix", a)
+            self.assertIn("glsync efetivo: swapfence,uploadflush,otherflush (origem: padrao)", r.stdout)
+
+    def test_glsync_swapfence_accepted_and_swapfinish_fallback(self):
+        r = self.run_launcher("-GlSync", "SwapFence")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = self.agent_arg(self.cmdline(r))
+        self.assertTrue(a.endswith(",glsync=swapfence"), a)
+        self.assertIn("glsync efetivo: swapfence (origem: opcao -GlSync)", r.stdout)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-GlSync", "swapfinish")))
+        self.assertTrue(a.endswith(",glsync=swapfinish"), a)
+
+    def test_glsync_none_disables(self):
+        r = self.run_launcher("-GlSync", "none")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertNotIn("glsync", a)
+        self.assertIn("glsync efetivo: nenhum (origem: opcao -GlSync none)", r.stdout)
+        self.assertEqual(self.run_launcher("-GlSync", "NONE,swapfinish").returncode, 2)
+        self.assertEqual(self.run_launcher("-NoAgent", "-GlSync", "none").returncode, 2)
+
+    def test_old_behavior_via_options(self):
+        r = self.run_launcher("-GlSync", "none", "-RenderFix", "flushtex", "-VboSync", "sync")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertTrue(a.endswith(",renderfix=flushtex,collapse=player,vbosync=sync"), a)
+        self.assertIn("renderfix efetivo: flushtex (origem: opcao -RenderFix)", r.stdout)
+        self.assertIn("vbosync efetivo: sync (origem: opcao -VboSync)", r.stdout)
+
+    def test_vbosync_invalidate(self):
+        r = self.run_launcher("-VboSync", "invalidate")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertIn(",vbosync=invalidate", a)
+        self.assertNotIn("vbosync=sync", a)
+        self.assertIn("vbosync efetivo: invalidate (origem: opcao -VboSync)", r.stdout)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-NoFboChunk", "-VboSync", "sync")))
+        self.assertIn(",vbosync=sync", a)
+
+    def test_vbosync_case_insensitive_is_normalized(self):
+        a = self.agent_arg(self.cmdline(self.run_launcher("-VboSync", "INVALIDATE")))
+        self.assertIn(",vbosync=invalidate", a)
+
+    def test_noagent_has_no_vbosync_in_cmdline(self):
+        self.assertNotIn("vbosync=", self.cmdline(self.run_launcher("-NoAgent")))
+
+    def test_uidiag_switch(self):
+        a = self.agent_arg(self.cmdline(self.run_launcher("-UiDiag")))
+        self.assertTrue(a.endswith(",vbosync=sync,uidiag,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
+        self.assertNotIn("uidiag", self.agent_arg(self.cmdline(self.run_launcher())))
+        self.assertEqual(self.run_launcher("-NoAgent", "-UiDiag").returncode, 2)
+
+    def test_uimodeldiag_switch(self):
+        a = self.agent_arg(self.cmdline(self.run_launcher("-UiModelDiag")))
+        self.assertTrue(a.endswith(",vbosync=sync,uimodeldiag,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-UiDiag", "-UiModelDiag")))
+        self.assertTrue(a.endswith(",vbosync=sync,uidiag,uimodeldiag,glsync=swapfence,glsync=uploadflush,glsync=otherflush"), a)
+        self.assertNotIn("uimodeldiag", self.agent_arg(self.cmdline(self.run_launcher())))
+        self.assertEqual(self.run_launcher("-NoAgent", "-UiModelDiag").returncode, 2)
+
+    def test_glsync_list_and_header(self):
+        r = self.run_launcher("-GlSync", "SwapFinish,modelfinish,swapfinish")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertTrue(a.endswith(",glsync=swapfinish,glsync=modelfinish"), a)
+        self.assertIn("glsync efetivo: swapfinish,modelfinish (origem: opcao -GlSync)", r.stdout)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-GlSync", "swapflush", "-UiModelDiag")))
+        self.assertTrue(a.endswith(",uimodeldiag,glsync=swapflush"), a)
+
+    def test_glsync_upload_and_clear_values(self):
+        r = self.run_launcher("-GlSync", "UploadFinish,uploadflush,uploadcount,clearfinish,clearflush,swapfinish")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertTrue(a.endswith(",glsync=uploadfinish,glsync=uploadflush,glsync=uploadcount,glsync=clearfinish,glsync=clearflush,glsync=swapfinish"), a)
+        self.assertIn("glsync efetivo: uploadfinish,uploadflush,uploadcount,clearfinish,clearflush,swapfinish (origem: opcao -GlSync)", r.stdout)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-NoFboChunk", "-GlSync", "uploadcount")))
+        self.assertTrue(a.endswith(",glsync=uploadcount"), a)
+        self.assertNotIn("swapfinish", a)
+
+    def test_glsync_dirty_all_and_other_values(self):
+        r = self.run_launcher("-GlSync", "SwapFinish,uploadflush,otherflush")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertTrue(a.endswith(",glsync=swapfinish,glsync=uploadflush,glsync=otherflush"), a)
+        a = self.agent_arg(self.cmdline(self.run_launcher("-GlSync", "uploadflushall,uploadfinishall,otherfinish")))
+        self.assertTrue(a.endswith(",glsync=uploadflushall,glsync=uploadfinishall,glsync=otherfinish"), a)
+
+    def test_glsync_errors(self):
+        r = self.run_launcher("-NoAgent", "-GlSync", "swapfinish")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("-GlSync", r.stderr)
+        r = self.run_launcher("-GlSync", "foo")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("-GlSync invalido", r.stderr)
+        r = self.run_launcher("-NoAgent")
+        self.assertIn("glsync efetivo: nao aplicavel (-NoAgent)", r.stdout)
+
+    def read_cache_opt(self):
+        with open(os.path.join(self.cache, "options.ini"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_resolution_and_dpi_default_unchanged(self):
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write("width=1920\r\nheight=1280\r\nfullScreen=false\r\n")
+        r = self.run_launcher()
+        self.cmdline(r)
+        self.assertIn("resolucao: 1920x1280 (origem: copia do options.ini do usuario no cache)", r.stdout)
+        self.assertIn("dpi: nenhum (padrao)", r.stdout)
+        self.assertNotIn("__COMPAT_LAYER", r.stdout)
+        r = self.run_launcher()   # 2a execucao: o valor vem do cache
+        self.assertIn("resolucao: 1920x1280 (origem: cache\\options.ini de execucao anterior)", r.stdout)
+        opt = self.read_cache_opt()
+        self.assertIn("width=1920", opt)
+        self.assertIn("height=1280", opt)
+
+    def test_resolution_writes_cache_only_and_sets_dpi(self):
+        original = "width=2880\r\nheight=1920\r\nfullScreen=false\r\n"
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write(original)
+        r = self.run_launcher("-Resolution", "1600x900")
+        self.cmdline(r)
+        opt = self.read_cache_opt()
+        self.assertIn("width=1600", opt)
+        self.assertIn("height=900", opt)
+        self.assertNotIn("width=2880", opt)
+        self.assertIn("fullScreen=false", opt)
+        with open(self.user_opt, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), original)   # nunca mexe no options.ini do usuario
+        self.assertIn("resolucao: 1600x900 (origem: opcao -Resolution", r.stdout)
+        self.assertIn("dpi: DPIUNAWARE (origem: opcao -Resolution)", r.stdout)
+        self.assertIn("__COMPAT_LAYER=DPIUNAWARE", r.stdout)
+
+    def test_resolution_appends_missing_keys(self):
+        r = self.run_launcher("-Resolution", "1920x1280")
+        self.cmdline(r)
+        opt = self.read_cache_opt()
+        self.assertRegex(opt, r"(?m)^width=1920\r?$")
+        self.assertRegex(opt, r"(?m)^height=1280\r?$")
+
+    def test_framerate_writes_cache_only(self):
+        original = "frameRate=60\r\nwidth=1920\r\n"
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write(original)
+        r = self.run_launcher("-FrameRate", "30")
+        self.cmdline(r)
+        opt = self.read_cache_opt()
+        self.assertIn("frameRate=30", opt)
+        self.assertNotIn("frameRate=60", opt)
+        self.assertIn("width=1920", opt)
+        with open(self.user_opt, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), original)
+        self.assertIn("framerate: 30 (origem: opcao -FrameRate", r.stdout)
+        self.assertIn("resolucao: nao alterada (padrao)", r.stdout)
+        self.assertIn("dpi: nenhum (padrao)", r.stdout)   # -FrameRate nao mexe no dpi
+
+    def test_framerate_default_and_append_and_invalid(self):
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write("frameRate=60\r\n")
+        r = self.run_launcher()
+        self.cmdline(r)
+        self.assertIn("framerate: 60 (origem: copia do options.ini do usuario no cache)", r.stdout)
+        self.assertIn("frameRate=60", self.read_cache_opt())
+        r = self.run_launcher("-FrameRate", "30")
+        r = self.run_launcher()
+        self.assertIn("framerate: 30 (origem: cache\\options.ini de execucao anterior)", r.stdout)
+        shutil.rmtree(self.cache, ignore_errors=True)
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write("width=1920\r\n")
+        self.assertIn("framerate: nao alterado (padrao)", self.run_launcher().stdout)
+        shutil.rmtree(self.cache, ignore_errors=True)
+        os.remove(self.user_opt)
+        self.cmdline(self.run_launcher("-FrameRate", "144"))
+        self.assertRegex(self.read_cache_opt(), r"(?m)^frameRate=144\r?$")
+        for bad in ("9", "241", "0", "-5"):
+            r = self.run_launcher("-FrameRate", bad)
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("-FrameRate invalido", r.stderr)
+        self.assertNotEqual(self.run_launcher("-FrameRate", "abc").returncode, 0)
+
+    def test_resolution_invalid(self):
+        for bad in ("1920", "19x1280", "1920x12", "axb", "1920X1280", "12345x1280"):
+            r = self.run_launcher("-Resolution", bad)
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("-Resolution invalido", r.stderr)
+
+    def test_dpiunaware_only_and_env_respected(self):
+        with open(self.user_opt, "w", encoding="utf-8", newline="") as f:
+            f.write("width=2880\r\nheight=1920\r\n")
+        r = self.run_launcher("-DpiUnaware")
+        self.cmdline(r)
+        self.assertIn("dpi: DPIUNAWARE (origem: opcao -DpiUnaware)", r.stdout)
+        self.assertIn("resolucao: 2880x1920 (origem: copia do options.ini do usuario no cache)", r.stdout)
+        self.assertIn("width=2880", self.read_cache_opt())
+        r = self.run_launcher("-Resolution", "1600x900", "-Env", "__COMPAT_LAYER=HIGHDPIAWARE")
+        self.cmdline(r)
+        self.assertIn("__COMPAT_LAYER=HIGHDPIAWARE", r.stdout)
+        self.assertNotIn("DPIUNAWARE", r.stdout)
+        self.assertIn("dpi: HIGHDPIAWARE (origem: -Env explicito", r.stdout)
+
+    def test_stutterdiag_and_gclog(self):
+        a = self.agent_arg(self.cmdline(self.run_launcher("-StutterDiag")))
+        self.assertTrue(a.endswith(",glsync=swapfence,glsync=uploadflush,glsync=otherflush,stutterdiag"), a)
+        self.assertNotIn("stutterdiag", self.agent_arg(self.cmdline(self.run_launcher())))
+        self.assertEqual(self.run_launcher("-NoAgent", "-StutterDiag").returncode, 2)
+        c = self.cmdline(self.run_launcher("-GcLog"))
+        self.assertRegex(c, r"-Xlog:gc\*,safepoint:file=\S*logs\\gc-\d{8}-\d{6}\.log:uptime,time,level,tags")
+        self.assertNotIn("-Xlog", self.cmdline(self.run_launcher()))
+        self.assertIn("-Xlog:gc*", self.cmdline(self.run_launcher("-NoAgent", "-GcLog")))
+
+    def test_vbosync_none_omits(self):
+        r = self.run_launcher("-VboSync", "none")
+        a = self.agent_arg(self.cmdline(r))
+        self.assertNotIn("vbosync", a)
+        self.assertIn("vbosync efetivo: nenhum (origem: opcao -VboSync none)", r.stdout)
+
+    def test_vbosync_conflicts(self):
+        for v in ("sync", "invalidate", "none"):
+            r = self.run_launcher("-NoAgent", "-VboSync", v)
+            self.assertEqual(r.returncode, 2, v)
+            self.assertIn("-VboSync", r.stderr)
+        self.assertNotEqual(self.run_launcher("-VboSync", "xyz").returncode, 0)
+
     def test_render_diag_args(self):
         c = self.cmdline(self.run_launcher("-RenderDiag", "-RenderDiagEvery", "8"))
-        self.assertIn(",renderdiag,diagevery=8,renderfix=flushtex,collapse=player", c)
+        self.assertIn(",renderdiag,diagevery=8,collapse=player", c)
+        self.assertNotIn("renderfix", c)
         c = self.cmdline(self.run_launcher("-NoFboChunk", "-RenderDiag"))
         self.assertIn(",renderdiag,diagevery=64", c)
         self.assertNotIn("renderfix", c)

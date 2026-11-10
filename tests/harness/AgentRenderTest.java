@@ -28,6 +28,20 @@ import org.lwjgl.opengl.GL20;
  * (bytes do jar -> PzArmAgent.instrumentCutaways): 2 trocas dentro de CalculateBuildingsToCollapse, nenhum outro metodo alterado,
  * caminho fatal (classe sem o alvo -> IllegalStateException), a classe viva (transformada pelo agente) carrega e passa no verificador, e a
  * logica de collapseNear (ponto do jogador/mouse chamam o original; vizinho zera lista e occludedByOrphanStructureFlag).
+ * Modo -Dtest.fix=vbosync (agente com vbosync=sync, sem GL): vboAccess (0x26 -> 0x06 em sync; 0x0A / 0x06 em invalidate com offset 0 / 16),
+ * transformacao REAL de zombie.core.VBO.GLVertexBufferObject (2 GL30.glMapBufferRange + 2 ARBMapBufferRange.glMapBufferRange trocados por mapRange30/mapRangeArb,
+ * nenhuma chamada original restante), caminho fatal (classe sem os alvos -> IllegalStateException) e a classe viva transformada carrega e verifica.
+ * Modo -Dtest.fix=uidiag (agente com uidiag, sem GL): transformacao REAL de zombie.ui.UI3DModel$Drawer (uiDrawRender em render, uiDrawPost em postRender,
+ * uiRenderMainRet + uiDrawInit em init), nenhum outro metodo alterado, caminho fatal, contadores, formato da linha do uidiag.log e a classe viva carrega e verifica.
+ * Modo -Dtest.fix=uimodeldiag (agente com uimodeldiag, sem GL): transformacao REAL de zombie.ui.UI3DModel$Drawer (DoRender -> uiDoRender, 1 troca em render),
+ * demais metodos identicos, caminho fatal, gridSample/diffCount, formato das linhas f= e SEC do uimodel.log e a classe viva carrega e verifica.
+ * Modo -Dtest.fix=glsync (agente com glsync=swapfinish,glsync=modelfinish, sem GL): transformacao REAL de zombie.ui.UI3DModel$Drawer (modelSync logo apos DoRender,
+ * tambem depois de uiDoRender) e de org.lwjglx.opengl.Display (glfwSwapBuffers -> swapSync, tambem com FpsCounter.swap), caminho fatal e formato do glsync.log.
+ * Modo -Dtest.fix=upload (agente com glsync=uploadcount, sem GL): conta OFFLINE, em todo o jar do jogo (zombie/, org/lwjglx/, se/krka/), os pontos de insercao de
+ * preUpload por nome (instrumentUpload), transforma classes reais (a 1a com glTexSubImage2D e a 1a com glBufferData), confere que cada ponto virou 1 preUpload e que
+ * as classes vivas (transformadas pelo agente ao carregar) ligam e passam no verificador; preUpload sem thread de render nao faz nada.
+ * Modo -Dtest.fix=stutter (agente com stutterdiag, sem GL): formatos das linhas do stutter.log, e a transformacao REAL de zombie.iso.fboRenderChunk.FBORenderChunk
+ * (chunkEnter/chunkExit instalados pelo stutterdiag sem renderfix: 1 de cada) e a classe viva carrega e verifica; RenderThread.getWaitTime existe.
  * Saida: linhas "CHECK nome: OK|FALHOU"; exit 0 se tudo OK, 1 se algum falhou.
  */
 public class AgentRenderTest {
@@ -166,8 +180,236 @@ public class AgentRenderTest {
         System.exit(fails == 0 ? 0 : 1);
     }
 
+    static void vboTests() throws Exception {
+        check("vboAccess sync: 0x26 -> 0x06", PzArmAgent.vboAccess(0x26, 0, PzArmAgent.VBO_SYNC) == 0x06);
+        check("vboAccess sync: offset 16 tambem remove so UNSYNCHRONIZED", PzArmAgent.vboAccess(0x26, 16, PzArmAgent.VBO_SYNC) == 0x06);
+        check("vboAccess invalidate: 0x26 offset 0 -> 0x0A", PzArmAgent.vboAccess(0x26, 0, PzArmAgent.VBO_INVALIDATE) == 0x0A);
+        check("vboAccess invalidate: 0x26 offset 16 -> 0x06", PzArmAgent.vboAccess(0x26, 16, PzArmAgent.VBO_INVALIDATE) == 0x06);
+        String vbo = "zombie.core.VBO.GLVertexBufferObject";
+        byte[] orig = bytesOf(vbo);
+        ClassModel cmO = ClassFile.of().parse(orig);
+        check("original: 4 chamadas a glMapBufferRange", count(cmO, null, "glMapBufferRange") == 4);
+        byte[] out = PzArmAgent.instrumentVbo(orig);
+        ClassModel cmT = ClassFile.of().parse(out);
+        check("transformado: 0 chamadas diretas a glMapBufferRange no jogo", count(cmT, null, "glMapBufferRange") == 0);
+        check("transformado: 2 mapRange30 e 2 mapRangeArb", count(cmT, null, "mapRange30") == 2 && count(cmT, null, "mapRangeArb") == 2);
+        boolean fatal = false;
+        try { PzArmAgent.instrumentVbo(bytesOf("zombie.iso.IsoCamera")); } catch (IllegalStateException e) { fatal = true; }
+        check("classe sem os 4 pontos de troca -> IllegalStateException (o agente chama fatal)", fatal);
+        Class<?> live = Class.forName(vbo, true, AgentRenderTest.class.getClassLoader());
+        check("GLVertexBufferObject transformado carrega e verifica", live != null);
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void uiTests() throws Exception {
+        String ui = "zombie.ui.UI3DModel$Drawer";
+        byte[] orig = bytesOf(ui);
+        ClassModel cmO = ClassFile.of().parse(orig);
+        check("original: sem chamadas ao agente", count(cmO, null, "uiDrawRender") + count(cmO, null, "uiDrawPost") + count(cmO, null, "uiDrawInit") == 0);
+        byte[] out = PzArmAgent.instrumentUiDrawer(orig);
+        ClassModel cmT = ClassFile.of().parse(out);
+        check("transformado: uiDrawRender so em render", count(cmT, "render", "uiDrawRender") == 1 && count(cmT, null, "uiDrawRender") == 1);
+        check("transformado: uiDrawPost so em postRender", count(cmT, "postRender", "uiDrawPost") == 1 && count(cmT, null, "uiDrawPost") == 1);
+        check("transformado: uiDrawInit e uiRenderMainRet so em init", count(cmT, "init", "uiDrawInit") == 1 && count(cmT, "init", "uiRenderMainRet") == 1
+                && count(cmT, null, "uiDrawInit") == 1 && count(cmT, null, "uiRenderMainRet") == 1);
+        boolean same = true;
+        for (MethodModel mm : cmO.methods()) {
+            String n = mm.methodName().stringValue();
+            if (n.equals("render") || n.equals("postRender") || n.equals("init")) continue;
+            if (!shape(cmO, n).equals(shape(cmT, n))) { same = false; System.out.println("  metodo alterado: " + n); }
+        }
+        check("transformado: demais metodos identicos", same && cmO.methods().size() == cmT.methods().size());
+        boolean fatal = false;
+        try { PzArmAgent.instrumentUiDrawer(bytesOf("zombie.iso.IsoCamera")); } catch (IllegalStateException e) { fatal = true; }
+        check("classe sem os alvos -> IllegalStateException (o agente chama fatal)", fatal);
+        PzArmAgent.uiRenderMainRet(7); PzArmAgent.uiRenderMainRet(7); PzArmAgent.uiDrawRender(); PzArmAgent.uiDrawPost(true); PzArmAgent.uiDrawPost(false); PzArmAgent.uiDrawInit(false);
+        check("contadores do agente", PzArmAgent.uiRet.get(7).get() == 2 && PzArmAgent.uiRender.get() == 1 && PzArmAgent.uiPostTrue.get() == 1 && PzArmAgent.uiPostFalse.get() == 1 && PzArmAgent.uiInit.get() == 1);
+        check("formato da linha do uidiag.log", PzArmAgent.uiLine("12:00:01", 3, 1, 5, 4, 1, "{0:3}", 60)
+                .equals("t=12:00:01 init=3 initRendered=1 initNotRendered=2 render=5 postTrue=4 postFalse=1 renderMainRet={0:3} swaps=60"));
+        Class<?> live = Class.forName(ui, true, AgentRenderTest.class.getClassLoader());
+        check("UI3DModel$Drawer transformado carrega e verifica", live != null);
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void uiModelTests() throws Exception {
+        String ui = "zombie.ui.UI3DModel$Drawer";
+        byte[] orig = bytesOf(ui);
+        ClassModel cmO = ClassFile.of().parse(orig);
+        check("original: 1 DoRender em render", count(cmO, "render", "DoRender") == 1 && count(cmO, null, "uiDoRender") == 0);
+        byte[] out = PzArmAgent.instrumentUiModel(orig);
+        ClassModel cmT = ClassFile.of().parse(out);
+        check("transformado: 0 DoRender e 1 uiDoRender em render", count(cmT, null, "DoRender") == 0 && count(cmT, "render", "uiDoRender") == 1 && count(cmT, null, "uiDoRender") == 1);
+        boolean same = true;
+        for (MethodModel mm : cmO.methods()) {
+            String n = mm.methodName().stringValue();
+            if (n.equals("render")) continue;
+            if (!shape(cmO, n).equals(shape(cmT, n))) { same = false; System.out.println("  metodo alterado: " + n); }
+        }
+        check("transformado: demais metodos identicos", same && cmO.methods().size() == cmT.methods().size());
+        boolean fatal = false;
+        try { PzArmAgent.instrumentUiModel(bytesOf("zombie.iso.IsoCamera")); } catch (IllegalStateException e) { fatal = true; }
+        check("classe sem DoRender -> IllegalStateException (o agente chama fatal)", fatal);
+        java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocateDirect(4 * 4 * 4).order(java.nio.ByteOrder.nativeOrder());
+        for (int i = 0; i < 16; i++) bb.putInt(i * 4, i);
+        int[] g = PzArmAgent.gridSample(bb, 4, 4, 2, 2);
+        check("gridSample 4x4 -> 2x2", g.length == 4 && g[0] == 0 && g[1] == 2 && g[2] == 8 && g[3] == 10);
+        check("diffCount", PzArmAgent.diffCount(new int[] {1, 2, 3}, new int[] {1, 5, 6}) == 2);
+        check("formato da linha de quadro", PzArmAgent.uiFrameLine(7, "12:00:01.234", 10, 20, 2, 33, 4096, 1, 2, 3, 4)
+                .equals("f=7 t=12:00:01.234 mx=10 my=20 sig=2 changed=33 of=4096 rect=1,2,3,4"));
+        java.util.Map<Integer, Long> m = new java.util.TreeMap<>(); m.put(1, 58L); m.put(2, 2L);
+        check("formato da linha SEC", PzArmAgent.uiSecLine("12:00:01.234", 60, 12, 2, m).equals("SEC t=12:00:01.234 frames=60 mouseMoved=12 fail=2 sigs={1:58,2:2}"));
+        Class<?> live = Class.forName(ui, true, AgentRenderTest.class.getClassLoader());
+        check("UI3DModel$Drawer transformado carrega e verifica", live != null);
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void glSyncTests() throws Exception {
+        String ui = "zombie.ui.UI3DModel$Drawer", disp = "org.lwjglx.opengl.Display";
+        byte[] orig = bytesOf(ui);
+        ClassModel cmO = ClassFile.of().parse(orig);
+        byte[] out = PzArmAgent.instrumentModelSync(orig);
+        ClassModel cmT = ClassFile.of().parse(out);
+        check("Drawer: 1 modelSync em render, logo apos DoRender", count(cmT, "render", "modelSync") == 1 && count(cmT, null, "modelSync") == 1 && count(cmT, "render", "DoRender") == 1);
+        java.util.List<String> sh = shape(cmT, "render");
+        int i = 0; while (i < sh.size() && !sh.get(i).contains("AnimatedModel.DoRender")) i++;
+        check("Drawer: instrucao seguinte a DoRender e modelSync", i + 1 < sh.size() && sh.get(i + 1).contains("PzArmAgent.modelSync"));
+        byte[] both = PzArmAgent.instrumentModelSync(PzArmAgent.instrumentUiModel(orig));
+        ClassModel cmB = ClassFile.of().parse(both);
+        java.util.List<String> sb = shape(cmB, "render");
+        int j = 0; while (j < sb.size() && !sb.get(j).contains("PzArmAgent.uiDoRender")) j++;
+        check("Drawer com uimodeldiag: modelSync logo depois de uiDoRender", j + 1 < sb.size() && sb.get(j + 1).contains("PzArmAgent.modelSync"));
+        boolean same = true;
+        for (MethodModel mm : cmO.methods()) {
+            String n = mm.methodName().stringValue();
+            if (n.equals("render")) continue;
+            if (!shape(cmO, n).equals(shape(cmT, n))) same = false;
+        }
+        check("Drawer: demais metodos identicos", same);
+        boolean fatal = false;
+        try { PzArmAgent.instrumentModelSync(bytesOf("zombie.iso.IsoCamera")); } catch (IllegalStateException e) { fatal = true; }
+        check("Drawer: classe sem DoRender -> IllegalStateException", fatal);
+        byte[] dOrig = bytesOf(disp);
+        ClassModel dO = ClassFile.of().parse(dOrig);
+        int swaps = count(dO, null, "glfwSwapBuffers");
+        check("Display original tem glfwSwapBuffers", swaps >= 1 || count(dO, null, "swap") >= 1);
+        // o Display vivo ja foi transformado pelo agente (fps nao ativo: troca direta); aqui a transformacao manual dos bytes originais
+        byte[] dOut = PzArmAgent.instrumentSwap(dOrig);
+        ClassModel dT = ClassFile.of().parse(dOut);
+        check("Display: 0 glfwSwapBuffers e " + swaps + " swapSync", count(dT, null, "glfwSwapBuffers") == 0 && count(dT, null, "swapSync") == swaps);
+        // com o modo fps ja aplicado antes (FpsCounter.swap no lugar da chamada): encadeia
+        byte[] viaFps = FpsCounter.instrument(dOrig);
+        ClassModel dF = ClassFile.of().parse(PzArmAgent.instrumentSwap(viaFps));
+        check("Display apos FpsCounter.instrument: swapSync no lugar de FpsCounter.swap", count(dF, null, "swap") == 0 && count(dF, null, "swapSync") == swaps);
+        fatal = false;
+        try { PzArmAgent.instrumentSwap(bytesOf("zombie.iso.IsoCamera")); } catch (IllegalStateException e) { fatal = true; }
+        check("Display: classe sem glfwSwapBuffers -> IllegalStateException", fatal);
+        check("formato do glsync.log", PzArmAgent.glSyncLine("12:00:01", 60, 0, 59, 1).equals("t=12:00:01 swapFinish=60 swapFlush=0 modelFinish=59 modelFlush=1"));
+        Class<?> live = Class.forName(ui, true, AgentRenderTest.class.getClassLoader());
+        check("UI3DModel$Drawer transformado (agente) carrega e verifica", live != null);
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void uploadTests() throws Exception {
+        java.net.URL u = AgentRenderTest.class.getClassLoader().getResource("zombie/ui/UI3DModel.class");
+        String jarPath = java.net.URLDecoder.decode(u.getPath().substring(5, u.getPath().indexOf("!")), "UTF-8");
+        if (jarPath.startsWith("/") && jarPath.charAt(2) == ':') jarPath = jarPath.substring(1);
+        long[] total = new long[PzArmAgent.SITES_N];
+        String firstTex = null, firstBuf = null, firstWrap = null, firstGw = null;
+        int classes = 0, withSites = 0, failures = 0;
+        try (java.util.jar.JarFile jf = new java.util.jar.JarFile(jarPath)) {
+            for (java.util.Enumeration<java.util.jar.JarEntry> en = jf.entries(); en.hasMoreElements(); ) {
+                java.util.jar.JarEntry je = en.nextElement();
+                String n = je.getName();
+                if (!n.endsWith(".class") || !PzArmAgent.upPrefix(n)) continue;
+                classes++;
+                byte[] b;
+                try (InputStream in = jf.getInputStream(je)) { b = in.readAllBytes(); }
+                long[] sites = new long[PzArmAgent.SITES_N];
+                try {
+                    byte[] out = PzArmAgent.instrumentUpload(b, sites);
+                    if (out == null) continue;
+                    withSites++;
+                    int pre = 0, gw = 0;
+                    for (int i = 0; i < PzArmAgent.UP_N; i++) pre += (int) sites[i];
+                    for (int i = PzArmAgent.UP_N; i < PzArmAgent.SITES_N; i++) gw += (int) sites[i];
+                    for (int i = 0; i < sites.length; i++) total[i] += sites[i];
+                    ClassModel cm = ClassFile.of().parse(out);
+                    if (count(cm, null, "preUpload") != pre || count(cm, null, "postUpload") != pre || count(cm, null, "gpuWork") != gw) { failures++; System.out.println("  contagem diverge em " + n); }
+                    String cn = n.substring(0, n.length() - 6);
+                    if (firstTex == null && sites[0] > 0) firstTex = cn;
+                    if (firstBuf == null && sites[9] > 0) firstBuf = cn;
+                    if (firstWrap == null && sites[18] > 0) firstWrap = cn;
+                    if (firstGw == null && gw > 0 && pre > 0) firstGw = cn;
+                } catch (Throwable t) { failures++; System.out.println("  falhou: " + n + ": " + t); }
+            }
+        }
+        System.out.println("classes zombie/org.lwjglx/se.krka: " + classes + "; com pontos: " + withSites);
+        System.out.println("PONTOS POR NOME (jar inteiro; preUpload == postUpload; gpuWork.* = gpuWork):");
+        long all = 0, postTotal = 0, gwTotal = 0;
+        for (int i = 0; i < total.length; i++) {
+            System.out.println("  " + PzArmAgent.SITE_NAMES[i] + " = " + total[i]);
+            all += total[i];
+            if (i < PzArmAgent.UP_N) postTotal += total[i]; else gwTotal += total[i];
+        }
+        System.out.println("  TOTAL preUpload = " + postTotal + " ; postUpload = " + postTotal + " ; gpuWork = " + gwTotal + " ; soma = " + all);
+        check("nenhuma classe do jar falhou ao transformar", failures == 0);
+        check("ha pontos de insercao (glTexSubImage2D, glBufferData, glClear, gpuWork)", total[0] > 0 && total[9] > 0 && total[17] > 0 && gwTotal > 0);
+        for (String cn : new String[] {firstTex, firstBuf, firstWrap, firstGw}) {
+            if (cn == null) { System.out.println("  (sem classe de amostra)"); continue; }
+            System.out.println("  amostra: " + cn);
+            Class<?> c = Class.forName(cn.replace('/', '.'), false, AgentRenderTest.class.getClassLoader());
+            c.getDeclaredMethods();   // forca ligacao/verificacao da classe viva (transformada pelo agente)
+            check("classe viva transformada liga e verifica: " + cn, c != null);
+        }
+        long before = PzArmAgent.upCalls.get(0);
+        PzArmAgent.preUpload(0);
+        check("preUpload sem thread de render nao conta nem toca no GL", PzArmAgent.upCalls.get(0) == before);
+        check("preUpload sem thread de render conta por thread (others)", PzArmAgent.othersDesc().contains("main:1(glTexSubImage2D)"));
+        PzArmAgent.gpuWork();
+        check("gpuWork fora da thread de render nao marca sujo", !PzArmAgent.gpuDirty);
+        PzArmAgent.postUpload(0);   // sem render thread: nao faz nada (nao chega ao GL)
+        check("formato da linha glsync.log com upload", PzArmAgent.glSyncLine("12:00:01", 60, 0, 0, 0, 5, 1, 2, 0, "{glClear:2}", 7, 3, 1, "{Thread-9:12(glTexImage2D)}")
+                .equals("t=12:00:01 swapFinish=60 swapFlush=0 modelFinish=0 modelFlush=0 upFinish=5 upFlush=1 clearFinish=2 clearFlush=0 calls={glClear:2} skipped=7 otherFlush=3 otherFinish=1 others={Thread-9:12(glTexImage2D)}"));
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
+    static void stutterTests() throws Exception {
+        check("stutterNs lido do agente (padrao 45 ms)", PzArmAgent.stutterNs == 45_000_000L);
+        check("formato da linha lenta", PzArmAgent.stutterLine("12:00:01.234", 52_300_000L, 12_100_000L, 3_000_000L, 14, 2, 8_200_000L, 1, 3, 20_100_000L, 9, 5, 40, 2)
+                .equals("t=12:00:01.234 frameMs=52.3 finishMs=12.1 uploadSyncMs=3.0 uploads=14 chunks=2 chunkMs=8.2 gcCount=1 gcMs=3 mainWaitMs=20.1 flushDone=9 flushSkipped=5 otherUploads=40 otherFlush=2"));
+        check("formato do SUM", PzArmAgent.stutterSum("12:00:10.000", 300, 10, 612_000_000L, 3, 1, 0, 4)
+                .equals("SUM t=12:00:10.000 frames=300 slow=10 avgSlowMs=61.2 slowWithChunks=3 slowWithGc=1 slowFinishDominant=0 slowMainWaitDominant=4"));
+        check("SUM sem quadros lentos", PzArmAgent.stutterSum("t", 5, 0, 0, 0, 0, 0, 0).contains("avgSlowMs=0.0"));
+        String fc = "zombie.iso.fboRenderChunk.FBORenderChunk";
+        byte[] orig = bytesOf(fc);
+        ClassModel cmO = ClassFile.of().parse(orig);
+        check("original: sem chunkEnter/chunkExit", count(cmO, null, "chunkEnter") + count(cmO, null, "chunkExit") == 0);
+        ClassModel cmT = ClassFile.of().parse(PzArmAgent.instrumentChunk(orig));
+        check("transformado: 1 chunkEnter em beginRenderThread e 1 chunkExit em endRenderThread",
+                count(cmT, "beginRenderThread", "chunkEnter") == 1 && count(cmT, "endRenderThread", "chunkExit") == 1 && count(cmT, null, "chunkEnter") == 1 && count(cmT, null, "chunkExit") == 1);
+        Class<?> live = Class.forName(fc, false, AgentRenderTest.class.getClassLoader());
+        live.getDeclaredMethods();   // liga e verifica a classe viva (transformada pelo agente)
+        check("FBORenderChunk vivo (transformado pelo agente) liga e verifica", live != null);
+        boolean hasWait = false;
+        for (java.lang.reflect.Method m : zombie.core.opengl.RenderThread.class.getDeclaredMethods()) if (m.getName().equals("getWaitTime")) hasWait = true;
+        check("RenderThread.getWaitTime existe (mainWaitMs)", hasWait);
+        System.out.println(fails == 0 ? "TUDO OK" : ("FALHAS=" + fails));
+        System.exit(fails == 0 ? 0 : 1);
+    }
+
     public static void main(String[] a) throws Exception {
         String fix = System.getProperty("test.fix", "none");
+        if (fix.equals("stutter")) { stutterTests(); return; }
+        if (fix.equals("upload")) { uploadTests(); return; }
+        if (fix.equals("glsync")) { glSyncTests(); return; }
+        if (fix.equals("uimodeldiag")) { uiModelTests(); return; }
+        if (fix.equals("uidiag")) { uiTests(); return; }
+        if (fix.equals("vbosync")) { vboTests(); return; }
         if (fix.equals("collapse")) { collapseTests(); return; }
         if (!GLFW.glfwInit()) throw new IllegalStateException("glfwInit falhou");
         GLFW.glfwDefaultWindowHints();

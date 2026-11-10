@@ -32,13 +32,20 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.time.format.DateTimeFormatter;
 
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL13;
+import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
+import org.lwjgl.opengl.ARBMapBufferRange;
 import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GL32;
 import org.lwjgl.opengl.KHRDebug;
 import zombie.characters.IsoPlayer;
 import zombie.core.SceneShaderStore;
@@ -81,7 +88,63 @@ import zombie.iso.fboRenderChunk.FBORenderCutaways;
  *   IsoCell.occludedByOrphanStructureFlag, que o laco acumula com OR (nao fica defasado). O predio em que o jogador esta continua sendo
  *   tratado depois, pelo room id (playerWindowPeekingRoomId), fora das chamadas trocadas. CalculatePointsOfInterest e os demais usos dos
  *   pontos (corte de paredes) nao mudam. Custo por frame: 3 comparacoes de int por ponto.
- * Sem "diag", "fps", "pz", "renderdiag", "renderfix" nem "collapse" o agente nao faz nada.
+ * Modo vbosync: ...,vbosync=sync|invalidate (outro valor = fatal()). Hipotese (em teste, nao validada em jogo): zombie.core.VBO.GLVertexBufferObject
+ *   mapeia os buffers com glMapBufferRange(alvo, 0, tamanho, 0x26) = WRITE(0x2)|INVALIDATE_RANGE(0x4)|UNSYNCHRONIZED(0x20); o anel do SpriteRenderer
+ *   orfana com glBufferData(NULL) e mapeia sem sincronizar, e map(int) pula o orfanamento se o tamanho nao mudou. No Mesa D3D12 a CPU
+ *   reescreve vertices que a GPU ainda nao consumiu (sprites com textura/UV errados, piscando). O agente troca, em GLVertexBufferObject,
+ *   as 2 chamadas a GL30.glMapBufferRange e as 2 a ARBMapBufferRange.glMapBufferRange (exatamente 2+2, senao fatal()) por
+ *   PzArmAgent.mapRange30/mapRangeArb (mesma assinatura), que chamam o original com o acesso ajustado por vboAccess:
+ *   sync = remove UNSYNCHRONIZED (0x20); invalidate = como sync e, com offset 0, troca INVALIDATE_RANGE (0x4) por INVALIDATE_BUFFER (0x8).
+ *   Na 1a chamada imprime em stderr "[pzarm-agent] vbosync=<modo>: glMapBufferRange access 0x26 -> 0x6".
+ * Modo uidiag: ...,uidiag (diagnostico, sem alterar estado) descobre se o preview do personagem no menu some porque o jogo PULA o desenho em alguns
+ *   quadros. Instrumenta zombie.ui.UI3DModel$Drawer: render()V chama uiDrawRender() no inicio; postRender()V chama uiDrawPost(rendered) no inicio;
+ *   init(II)V chama uiRenderMainRet(int) logo depois de AnimatedModel.renderMain()I (dup do retorno antes do pop) e uiDrawInit(rendered) antes do
+ *   return (metodos ou campo ausentes = fatal()). Uma vez por segundo grava <dir>/uidiag.log:
+ *   "t=HH:mm:ss init=N initRendered=N initNotRendered=N render=N postTrue=N postFalse=N renderMainRet={v:n,...}[ swaps=N]" (contagens do ultimo segundo;
+ *   swaps = glfwSwapBuffers no segundo, so se o modo fps estiver ativo).
+ * Modo uimodeldiag: ...,uimodeldiag (diagnostico) troca em UI3DModel$Drawer.render()V a chamada AnimatedModel.DoRender(IIIIFF)V por
+ *   PzArmAgent.uiDoRender(AnimatedModel,IIIIFF)V (exatamente 1 troca, senao fatal()). Os 4 ints sao x, y, largura, altura do boneco ja em coordenadas
+ *   GL (render() passa absX, Core.height - absY - altura, largura, altura; y para cima) e viram o glViewport de UIModelCamera.Begin; DoRender comeca com
+ *   glClear(GL_DEPTH_BUFFER_BIT). uiDoRender captura o estado GL (framebuffers, viewport, scissor, stencil, depth, blend, cull, alpha test, programa,
+ *   bits de depth), le por glReadPixels uma grade de ate 64x64 pontos do retangulo antes e depois do DoRender original (chamado exatamente 1 vez) e
+ *   conta pixels que mudaram. Grava <dir>/uimodel.log (limite ~20 MB, depois so linhas SEC):
+ *   "SIG id=N drawfb=.. readfb=.. readbuf=.. vp=x,y,w,h scissor=on|off box=.. stencil=.. depthTest=.. depthFunc=.. depthMask=.. depthRange=.. colorMask=..
+ *   blend=.. cull=.. alphaTest=.. prog=.. depthBits=..[ glerr=..]" (estado novo), "f=N t=HH:mm:ss.SSS mx=.. my=.. sig=N changed=K of=M rect=x,y,w,h" (por
+ *   quadro; mx/my = zombie.input.Mouse.getX/getY) e "SEC t=.. frames=.. mouseMoved=.. fail=.. sigs={id:n}" (por segundo; fail = quadros com changed
+ *   abaixo de 20% do maior changed visto).
+ * Modo glsync: ...,glsync=swapfinish|swapflush|swapfence|modelfinish|modelflush (repetivel; outro valor = fatal()). Contorno para um hazard de sincronizacao CPU-GPU no
+ *   Mesa GLon12 (o boneco do menu parou de sumir quando o uimodeldiag forcou glReadPixels). swapfinish/swapflush: glFinish()/glFlush() imediatamente antes de
+ *   cada glfwSwapBuffers de org.lwjglx.opengl.Display (a chamada vira PzArmAgent.swapSync, que depois chama FpsCounter.swap se o modo fps estiver ativo, senao
+ *   GLFW.glfwSwapBuffers; pelo menos 1 troca, senao fatal()). modelfinish/modelflush: glFinish()/glFlush() logo DEPOIS de AnimatedModel.DoRender em
+ *   UI3DModel$Drawer.render (depois de uiDoRender, se o uimodeldiag estiver ativo; exatamente 1 ponto, senao fatal()). Uma vez por segundo grava
+ *   <dir>/glsync.log: "t=HH:mm:ss swapFinish=N swapFlush=N modelFinish=N modelFlush=N" (contagens do ultimo segundo; com upload/clear/other ativos acrescenta upFinish upFlush clearFinish clearFlush calls skipped otherFlush otherFinish others; com swapfence acrescenta no fim swapFence=N fenceWaitMs=X) e imprime
+ *   "[pzarm-agent] modo glsync ativo: ..." em stderr.
+ *   swapfence (padrao do launcher, com uploadflush,otherflush e vbosync=sync): em vez de glFinish, cada troca de buffers cria um fence (glFenceSync) e espera
+ *   (glClientWaitSync) o fence do quadro anterior, atrasado de 1 quadro; CPU e GPU seguem em paralelo. fenceWaitMs = tempo gasto nessa espera no ultimo segundo.
+ *   Valores extras (combinaveis): uploadfinish/uploadflush = glFinish/glFlush ANTES de cada upload/copia de textura ou buffer (glTexSubImage2D/3D, glTexImage2D/3D,
+ *   glCompressedTex*Image2D, glCopyTex*Image2D, glBufferSubData, glBufferData, glMapBuffer, glMapBufferRange, glUnmapBuffer, glGenerateMipmap(EXT),
+ *   glBlitFramebuffer(EXT) e os wrappers zombie/core/VBO/IGLBufferObject.glBufferData/glBufferSubData/glMapBuffer/glUnmapBuffer); clearfinish/clearflush = o mesmo
+ *   antes de glClear (contado a parte); uploadcount = so conta. Um transformer insere invokestatic PzArmAgent.preUpload(id) antes de cada chamada, em toda
+ *   classe zombie/, org/lwjglx/ e se/krka/ (filtro rapido por bytes; falha numa classe = aviso em stderr e a classe fica sem alteracao, nunca fatal). preUpload so age
+ *   na thread de render capturada no 1o swap (antes disso nao faz nada). stderr: "[pzarm-agent] uploadsync: classes=N pontos={nome:n}" a cada 1000 classes
+ *   transformadas e no 1o swap. glsync.log ganha: upFinish=N upFlush=N clearFinish=N clearFlush=N calls={nome:n,...} (so ids nao zero, por segundo).
+ * Modo stutterdiag: ...,stutterdiag[,stutterms=N] (N padrao 45) mede por quadro (de um swapSync ao proximo, na thread de render) o tempo total (frameMs), o tempo
+ *   gasto nos glFinish/glFlush do swapSync (finishMs) e do preUpload (uploadSyncMs), o numero de preUpload (uploads), as chamadas a
+ *   FBORenderChunk.beginRenderThread (chunks) e o tempo somado ate endRenderThread (chunkMs; chunkEnter/chunkExit sao instalados mesmo sem renderfix),
+ *   GC desde o quadro anterior (gcCount/gcMs: soma de ManagementFactory.getGarbageCollectorMXBeans, 1 leitura por quadro) e mainWaitMs
+ *   (RenderThread.getWaitTime(): o proprio jogo mede quanto a thread de render esperou o estado da thread principal em acquireStateForRendering). Implica o
+ *   transformer de upload em modo uploadcount (so conta) e o hook do swap. Grava <dir>/stutter.log so com os quadros com frameMs >= stutterms:
+ *   "t=HH:mm:ss.SSS frameMs=.. finishMs=.. uploadSyncMs=.. uploads=N chunks=N chunkMs=.. gcCount=N gcMs=N mainWaitMs=.." e a cada 10 s
+ *   "SUM t=.. frames=.. slow=.. avgSlowMs=.. slowWithChunks=.. slowWithGc=.. slowFinishDominant=.. slowMainWaitDominant=.." (dominante = mais de 50% do frameMs).
+ *   Flush sem redundancia: uploadflush/uploadfinish so sincronizam se a thread de render fez trabalho de GPU desde o ultimo flush/finish/swap (PzArmAgent.gpuWork()V
+ *   inserido antes de glDrawArrays/Elements/RangeElements/ArraysInstanced/ElementsInstanced, glMultiDraw*, glClear, glBlitFramebuffer, glCopyTexSubImage2D,
+ *   glCopyTexImage2D e glBegin; o hook draw() do renderfix tambem marca); uploadflushall/uploadfinishall = comportamento antigo (sempre). otherflush/otherfinish =
+ *   glFlush/glFinish DEPOIS de cada upload da lista (PzArmAgent.postUpload(I)V) em threads que nao sao a de render e tem contexto GL atual. O glsync.log ganha
+ *   skipped=N otherFlush=N otherFinish=N others={thread:n(idMaisFrequente),...} (preUpload por thread que nao e a de render).
+ * Tamanho do framebuffer: a cada swap (modo fps, via FpsCounter.swap, ou glsync, via swapSync) o agente le glfwGetFramebufferSize/glfwGetWindowSize do handle do
+ *   swap e, na 1a vez e sempre que mudar, imprime em stderr "[pzarm-agent] framebuffer=WxH janela=WxH" e grava "# t=.. framebuffer=.. janela=.." no glsync.log (se existir)
+ *   ou como comentario no csv de fps.
+ * Sem "diag", "fps", "pz", "renderdiag", "renderfix", "collapse", "vbosync", "uidiag", "uimodeldiag" nem "glsync" o agente nao faz nada.
  */
 public final class PzArmAgent {
     static final String TARGET = "zombie/core/textures/TextureFBO";
@@ -141,7 +204,7 @@ public final class PzArmAgent {
         if (args == null) return;
         Path log = Path.of("logs", "fbo-debug.log");
         Path dir = Path.of("logs");
-        boolean diag = false, fps = false;
+        boolean diag = false, fps = false, uidiag = false, uimodeldiag = false, glsync = false, stutterdiag = false;
         List<String> pz = new ArrayList<>();
         for (String a : args.split(",")) {
             if (a.equals("renderdiag")) renderDiag = true;
@@ -164,6 +227,20 @@ public final class PzArmAgent {
                 if (!a.substring(9).equals("player")) fatal("collapse invalido (player): " + a, new IllegalArgumentException(a));
                 collapse = true;
             }
+            else if (a.startsWith("vbosync=")) {
+                String v = a.substring(8);
+                if (v.equals("sync")) vboMode = VBO_SYNC;
+                else if (v.equals("invalidate")) vboMode = VBO_INVALIDATE;
+                else fatal("vbosync invalido (sync|invalidate): " + a, new IllegalArgumentException(a));
+            }
+            else if (a.startsWith("glsync=")) { parseGlSync(a.substring(7)); glsync = true; }
+            else if (a.equals("stutterdiag")) stutterdiag = true;
+            else if (a.startsWith("stutterms=")) {
+                try { stutterNs = Long.parseLong(a.substring(10)) * 1_000_000L; if (stutterNs < 1_000_000L) throw new NumberFormatException(a); }
+                catch (NumberFormatException e) { fatal("stutterms invalido (inteiro >= 1): " + a, e); }
+            }
+            else if (a.equals("uidiag")) uidiag = true;
+            else if (a.equals("uimodeldiag")) uimodeldiag = true;
             else if (a.equals("diag")) diag = true;
             else if (a.equals("fps")) fps = true;
             else if (a.startsWith("log=")) log = Path.of(a.substring(4));
@@ -174,8 +251,14 @@ public final class PzArmAgent {
         flushMode = renderFix.equals("flush") || renderFix.equals("flushtex") || renderFix.equals("flushchunk") || renderFix.equals("flushtexchunk");
         fxTex = renderFix.equals("flushtex") || renderFix.equals("flushtexchunk");
         fxChunk = renderFix.equals("flushchunk") || renderFix.equals("flushtexchunk");
-        if (fps) FpsCounter.install(inst, dir);
+        if (fps) { fpsOn = true; FpsCounter.install(inst, dir); }
         if (collapse) installCollapse(inst);
+        if (vboMode != 0) installVboSync(inst);
+        if (uidiag) installUiDiag(inst, dir);
+        if (uimodeldiag) installUiModel(inst, dir);
+        if (stutterdiag && !uploadActive()) upCountOn = true;   // o stutterdiag conta os uploads (preUpload) sem sincronizar
+        if (glsync || stutterdiag) installGlSync(inst, dir);
+        if (stutterdiag) installStutter(inst, dir);
         if (renderDiag || !renderFix.isEmpty()) installRender(inst, dir);
         if (!pz.isEmpty()) {
             try { for (String p : pz) parsePz(p); }
@@ -267,6 +350,849 @@ public final class PzArmAgent {
         }
         out.clear();
         cell.occludedByOrphanStructureFlag = false;
+    }
+
+    // ------------------------------------------------------------------ vbosync=sync|invalidate
+    static final String VBO_CLASS = "zombie/core/VBO/GLVertexBufferObject";
+    static final int VBO_SYNC = 1, VBO_INVALIDATE = 2;
+    static final int MAP_INVALIDATE_RANGE = 0x4, MAP_INVALIDATE_BUFFER = 0x8, MAP_UNSYNCHRONIZED = 0x20;
+    static int vboMode;               // 0 = desligado
+    static final AtomicBoolean vboLogged = new AtomicBoolean();
+
+    static void installVboSync(Instrumentation inst) {
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                if (!VBO_CLASS.equals(name)) return null;
+                try { return instrumentVbo(buf); }
+                catch (Throwable t) { fatal("falha ao transformar " + name, t); return null; }
+            }
+        });
+        System.err.println("[pzarm-agent] modo vbosync ativo: vbosync=" + vboName(vboMode));
+    }
+
+    static String vboName(int mode) { return mode == VBO_INVALIDATE ? "invalidate" : "sync"; }
+
+    /** GLVertexBufferObject: as 2 chamadas a GL30.glMapBufferRange e as 2 a ARBMapBufferRange.glMapBufferRange (IJJILjava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;
+     *  viram invokestatic PzArmAgent.mapRange30 / mapRangeArb (mesma assinatura). */
+    static byte[] instrumentVbo(byte[] bytes) {
+        ClassFile cf = ClassFile.of();
+        int[] n = {0, 0};
+        ClassDesc me = ClassDesc.of(ME);
+        String desc = "(IJJILjava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;";
+        CodeTransform ct = (CodeBuilder b, CodeElement e) -> {
+            if (e instanceof InvokeInstruction ii && ii.opcode() == Opcode.INVOKESTATIC && ii.name().equalsString("glMapBufferRange") && ii.type().equalsString(desc)) {
+                String owner = ii.owner().asInternalName();
+                if (owner.equals("org/lwjgl/opengl/GL30")) { b.invokestatic(me, "mapRange30", MethodTypeDesc.ofDescriptor(desc)); n[0]++; return; }
+                if (owner.equals("org/lwjgl/opengl/ARBMapBufferRange")) { b.invokestatic(me, "mapRangeArb", MethodTypeDesc.ofDescriptor(desc)); n[1]++; return; }
+            }
+            b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(mm -> true, ct));
+        if (n[0] != 2 || n[1] != 2)
+            throw new IllegalStateException("esperava 2 GL30.glMapBufferRange e 2 ARBMapBufferRange.glMapBufferRange em GLVertexBufferObject, achei " + n[0] + " e " + n[1]);
+        return out;
+    }
+
+    /** Decisao pura: acesso de glMapBufferRange ajustado. sync: sem UNSYNCHRONIZED; invalidate: como sync e, com offset 0, INVALIDATE_RANGE vira INVALIDATE_BUFFER. */
+    static int vboAccess(int access, long offset, int mode) {
+        int a = access & ~MAP_UNSYNCHRONIZED;
+        if (mode == VBO_INVALIDATE && offset == 0) a = (a & ~MAP_INVALIDATE_RANGE) | MAP_INVALIDATE_BUFFER;
+        return a;
+    }
+
+    static int vboAdjust(int access, long offset) {
+        int a = vboAccess(access, offset, vboMode);
+        if (vboLogged.compareAndSet(false, true)) {
+            System.err.println("[pzarm-agent] vbosync=" + vboName(vboMode) + ": glMapBufferRange access " + h(access) + " -> " + h(a));
+        }
+        return a;
+    }
+
+    /** No lugar de GL30.glMapBufferRange (chamado de GLVertexBufferObject). */
+    public static ByteBuffer mapRange30(int target, long offset, long length, int access, ByteBuffer old) {
+        return GL30.glMapBufferRange(target, offset, length, vboAdjust(access, offset), old);
+    }
+
+    /** No lugar de ARBMapBufferRange.glMapBufferRange (chamado de GLVertexBufferObject). */
+    public static ByteBuffer mapRangeArb(int target, long offset, long length, int access, ByteBuffer old) {
+        return ARBMapBufferRange.glMapBufferRange(target, offset, length, vboAdjust(access, offset), old);
+    }
+
+    // ------------------------------------------------------------------ uidiag
+    static final String UI_CLASS = "zombie/ui/UI3DModel$Drawer";
+    static final AtomicLong uiInit = new AtomicLong(), uiInitRendered = new AtomicLong(), uiRender = new AtomicLong(), uiPostTrue = new AtomicLong(), uiPostFalse = new AtomicLong();
+    static final ConcurrentSkipListMap<Integer, AtomicLong> uiRet = new ConcurrentSkipListMap<>();
+
+    static void installUiDiag(Instrumentation inst, Path dir) {
+        Path log = dir.toAbsolutePath().resolve("uidiag.log");
+        try {
+            Files.createDirectories(log.getParent());
+            Files.writeString(log, "# pzarm-agent uidiag " + LocalDateTime.now() + "\n# t init initRendered initNotRendered render postTrue postFalse renderMainRet swaps (contagens do ultimo segundo)\n");
+        } catch (IOException e) { fatal("nao foi possivel criar " + log, e); }
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                if (!UI_CLASS.equals(name)) return null;
+                try { return instrumentUiDrawer(buf); }
+                catch (Throwable t) { fatal("falha ao transformar " + name, t); return null; }
+            }
+        });
+        Thread t = new Thread(() -> uiWriter(log), "pzarm-uidiag");
+        t.setDaemon(true);
+        t.start();
+        System.err.println("[pzarm-agent] modo uidiag ativo, log: " + log);
+    }
+
+    static void uiWriter(Path log) {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss");
+        long[] prev = new long[6];
+        Map<Integer, Long> prevRet = new java.util.TreeMap<>();
+        while (true) {
+            try {
+                Thread.sleep(1000);
+                long[] cur = {uiInit.get(), uiInitRendered.get(), uiRender.get(), uiPostTrue.get(), uiPostFalse.get(), FpsCounter.frames};
+                StringBuilder ret = new StringBuilder("{");
+                for (Map.Entry<Integer, AtomicLong> en : uiRet.entrySet()) {
+                    long v = en.getValue().get(), d = v - prevRet.getOrDefault(en.getKey(), 0L);
+                    prevRet.put(en.getKey(), v);
+                    if (d != 0) { if (ret.length() > 1) ret.append(','); ret.append(en.getKey()).append(':').append(d); }
+                }
+                ret.append('}');
+                String line = uiLine(LocalDateTime.now().format(fmt), cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2], cur[3] - prev[3], cur[4] - prev[4],
+                        ret.toString(), FpsCounter.started ? cur[5] - prev[5] : -1);
+                prev = cur;
+                Files.writeString(log, line + "\n", StandardOpenOption.APPEND);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    /** Formato de uma linha do uidiag.log. swaps < 0 = omitido. */
+    static String uiLine(String t, long init, long initRendered, long render, long postTrue, long postFalse, String ret, long swaps) {
+        return "t=" + t + " init=" + init + " initRendered=" + initRendered + " initNotRendered=" + (init - initRendered) + " render=" + render
+                + " postTrue=" + postTrue + " postFalse=" + postFalse + " renderMainRet=" + ret + (swaps >= 0 ? " swaps=" + swaps : "");
+    }
+
+    public static void uiDrawRender() { uiRender.incrementAndGet(); }
+    public static void uiDrawPost(boolean rendered) { (rendered ? uiPostTrue : uiPostFalse).incrementAndGet(); }
+    public static void uiDrawInit(boolean rendered) { uiInit.incrementAndGet(); if (rendered) uiInitRendered.incrementAndGet(); }
+    public static void uiRenderMainRet(int v) { try { uiRet.computeIfAbsent(v, k -> new AtomicLong()).incrementAndGet(); } catch (Throwable ignored) { } }
+
+    /** UI3DModel$Drawer: render()V -> uiDrawRender() no inicio; postRender()V -> uiDrawPost(this.rendered) no inicio; init(II)V -> uiRenderMainRet(int)
+     *  apos AnimatedModel.renderMain()I e uiDrawInit(this.rendered) antes de cada return. Tudo exatamente 1 vez, senao IllegalStateException. */
+    static byte[] instrumentUiDrawer(byte[] bytes) {
+        ClassFile cf = ClassFile.of();
+        ClassModel cm = cf.parse(bytes);
+        ClassDesc me = ClassDesc.of(ME), self = ClassDesc.ofInternalName(UI_CLASS);
+        if (cm.fields().stream().noneMatch(f -> f.fieldName().equalsString("rendered") && f.fieldType().equalsString("Z")))
+            throw new IllegalStateException("campo boolean rendered ausente em " + UI_CLASS);
+        int[] n = {0, 0, 0, 0};   // render, postRender, returns de init, renderMain
+        boolean[] first = new boolean[2];
+        CodeTransform ctRender = (CodeBuilder b, CodeElement e) -> {
+            if (!first[0]) { first[0] = true; b.invokestatic(me, "uiDrawRender", MethodTypeDesc.ofDescriptor("()V")); n[0]++; }
+            b.with(e);
+        };
+        CodeTransform ctPost = (CodeBuilder b, CodeElement e) -> {
+            if (!first[1]) {
+                first[1] = true;
+                b.aload(0).getfield(self, "rendered", ConstantDescs.CD_boolean);
+                b.invokestatic(me, "uiDrawPost", MethodTypeDesc.ofDescriptor("(Z)V"));
+                n[1]++;
+            }
+            b.with(e);
+        };
+        CodeTransform ctInit = (CodeBuilder b, CodeElement e) -> {
+            if (e instanceof ReturnInstruction) {
+                b.aload(0).getfield(self, "rendered", ConstantDescs.CD_boolean);
+                b.invokestatic(me, "uiDrawInit", MethodTypeDesc.ofDescriptor("(Z)V"));
+                n[2]++;
+            }
+            b.with(e);
+            if (e instanceof InvokeInstruction ii && ii.opcode() == Opcode.INVOKEVIRTUAL && ii.name().equalsString("renderMain") && ii.type().equalsString("()I")
+                    && ii.owner().asInternalName().equals("zombie/core/skinnedmodel/advancedanimation/AnimatedModel")) {
+                b.dup();
+                b.invokestatic(me, "uiRenderMainRet", MethodTypeDesc.ofDescriptor("(I)V"));
+                n[3]++;
+            }
+        };
+        byte[] out = cf.transformClass(cm, ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("render") && mm.methodType().equalsString("()V"), ctRender));
+        out = cf.transformClass(cf.parse(out), ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("postRender") && mm.methodType().equalsString("()V"), ctPost));
+        out = cf.transformClass(cf.parse(out), ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("init") && mm.methodType().equalsString("(II)V"), ctInit));
+        if (n[0] != 1) throw new IllegalStateException("esperava 1 metodo Drawer.render()V, achei " + n[0]);
+        if (n[1] != 1) throw new IllegalStateException("esperava 1 metodo Drawer.postRender()V, achei " + n[1]);
+        if (n[2] != 1) throw new IllegalStateException("esperava 1 return em Drawer.init(II)V, achei " + n[2]);
+        if (n[3] != 1) throw new IllegalStateException("esperava 1 chamada a AnimatedModel.renderMain()I em Drawer.init, achei " + n[3]);
+        return out;
+    }
+
+    // ------------------------------------------------------------------ uimodeldiag
+    static final String AM_CLASS = "zombie/core/skinnedmodel/advancedanimation/AnimatedModel";
+    static final String UIM_DESC = "(L" + AM_CLASS + ";IIIIFF)V";
+    static final long UIM_MAX_BYTES = 20L * 1024 * 1024;
+    static Path uiModelLogPath;
+    static BufferedWriter uiModelLog;
+    static long uiModelBytes;
+    static long uiFrame, uiErr, uiMaxChanged, uiSecStart, uiSecFrames, uiSecMoved, uiSecFail;
+    static int uiPrevMx = Integer.MIN_VALUE, uiPrevMy = Integer.MIN_VALUE;
+    static final Map<String, Integer> uiSigs = new LinkedHashMap<>();
+    static final Map<Integer, Long> uiSecSigs = new java.util.TreeMap<>();
+    static ByteBuffer uiPix;
+    static final DateTimeFormatter UI_MS = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    static void installUiModel(Instrumentation inst, Path dir) {
+        uiModelLogPath = dir.toAbsolutePath().resolve("uimodel.log");
+        try {
+            Files.createDirectories(uiModelLogPath.getParent());
+            uiModelLog = Files.newBufferedWriter(uiModelLogPath, StandardCharsets.UTF_8);
+            umlog("# pzarm-agent uimodeldiag " + LocalDateTime.now());
+            umlog("# SIG id=N <estado GL> | f=N t=HH:mm:ss.SSS mx=X my=Y sig=N changed=K of=M rect=x,y,w,h (rect em coordenadas GL, y para cima) | SEC t=.. frames=.. mouseMoved=.. fail=.. sigs={id:n}");
+        } catch (IOException e) { fatal("nao foi possivel criar " + uiModelLogPath, e); }
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                if (!UI_CLASS.equals(name)) return null;
+                try { return instrumentUiModel(buf); }
+                catch (Throwable t) { fatal("falha ao transformar " + name, t); return null; }
+            }
+        });
+        System.err.println("[pzarm-agent] modo uimodeldiag ativo, log: " + uiModelLogPath);
+    }
+
+    /** UI3DModel$Drawer.render()V: troca a unica chamada AnimatedModel.DoRender(IIIIFF)V por PzArmAgent.uiDoRender(AnimatedModel,IIIIFF)V (o receptor ja esta
+     *  na pilha). No bytecode do 42.21, render() passa (absX, Core.height - absY - height, width, height, sizeV, animPlayerAngle): x e y ja em coordenadas GL (origem
+     *  embaixo, y para cima) do canto inferior esquerdo do boneco. AnimatedModel.DoRender faz glClear(GL_DEPTH_BUFFER_BIT), copia os 4 ints para
+     *  UIModelCamera.viewportX/Y/W/H e DoRender(IModelCamera); UIModelCamera.Begin chama glViewport(x,y,w,h). */
+    static byte[] instrumentUiModel(byte[] bytes) {
+        ClassFile cf = ClassFile.of();
+        int[] n = {0};
+        ClassDesc me = ClassDesc.of(ME);
+        CodeTransform ct = (CodeBuilder b, CodeElement e) -> {
+            if (e instanceof InvokeInstruction ii && ii.opcode() == Opcode.INVOKEVIRTUAL && ii.owner().asInternalName().equals(AM_CLASS)
+                    && ii.name().equalsString("DoRender") && ii.type().equalsString("(IIIIFF)V")) {
+                b.invokestatic(me, "uiDoRender", MethodTypeDesc.ofDescriptor(UIM_DESC));
+                n[0]++;
+            } else b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("render") && mm.methodType().equalsString("()V"), ct));
+        if (n[0] != 1) throw new IllegalStateException("esperava 1 chamada a AnimatedModel.DoRender(IIIIFF)V em UI3DModel$Drawer.render, achei " + n[0]);
+        return out;
+    }
+
+    static synchronized void umlog(String s) {
+        try {
+            if (uiModelLog == null) return;
+            if (uiModelBytes > UIM_MAX_BYTES && !s.startsWith("SEC")) return;
+            uiModelLog.write(s); uiModelLog.newLine();
+            uiModelBytes += s.length() + 2;
+        } catch (Throwable ignored) { }
+    }
+
+    static int gi(int p) { return GL11.glGetInteger(p); }
+    static String onoff(int cap) { return GL11.glIsEnabled(cap) ? "on" : "off"; }
+
+    /** Estado GL relevante para o desenho do boneco (so leitura). A string e a assinatura. */
+    static String uiState() {
+        StringBuilder sb = new StringBuilder();
+        int fb = gi(0x8CA6);
+        int[] vp = new int[4], sc = new int[4];
+        GL11.glGetIntegerv(0xBA2, vp);
+        GL11.glGetIntegerv(0xC10, sc);
+        double[] dr = new double[2];
+        GL11.glGetDoublev(0xB70, dr);
+        ByteBuffer cm = ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder());
+        GL11.glGetBooleanv(0xC23, cm);
+        sb.append("drawfb=").append(fb).append(" readfb=").append(gi(0x8CAA)).append(" readbuf=").append(h(gi(0xC02)))
+          .append(" vp=").append(vp[0]).append(',').append(vp[1]).append(',').append(vp[2]).append(',').append(vp[3])
+          .append(" scissor=").append(onoff(0xC11)).append(" box=").append(sc[0]).append(',').append(sc[1]).append(',').append(sc[2]).append(',').append(sc[3])
+          .append(" stencil=").append(onoff(0xB90)).append(" depthTest=").append(onoff(0xB71)).append(" depthFunc=").append(h(gi(0xB74)))
+          .append(" depthMask=").append(GL11.glGetBoolean(0xB72)).append(" depthRange=").append(dr[0]).append(',').append(dr[1])
+          .append(" colorMask=").append(cm.get(0)).append(',').append(cm.get(1)).append(',').append(cm.get(2)).append(',').append(cm.get(3))
+          .append(" blend=").append(onoff(0xBE2)).append(" cull=").append(onoff(0xB44)).append(" alphaTest=").append(onoff(0xBC0))
+          .append(" prog=").append(gi(0x8B8D));
+        int bits = fb == 0 ? gi(0xD56) : GL30.glGetFramebufferAttachmentParameteri(0x8CA9, 0x8D00, 0x8216);
+        sb.append(" depthBits=").append(bits);
+        int err = GL11.glGetError();
+        if (err != 0) sb.append(" glerr=").append(h(err));
+        return sb.toString();
+    }
+
+    /** Amostra uma grade nx*ny de pixels RGBA (empacotados em int) de um buffer cw*ch (linhas de baixo para cima, como o glReadPixels devolve). */
+    static int[] gridSample(ByteBuffer buf, int cw, int ch, int nx, int ny) {
+        int[] r = new int[nx * ny];
+        for (int j = 0; j < ny; j++) {
+            int row = (int) ((long) j * ch / ny);
+            for (int i = 0; i < nx; i++) {
+                int col = (int) ((long) i * cw / nx);
+                r[j * nx + i] = buf.getInt((row * cw + col) * 4);
+            }
+        }
+        return r;
+    }
+
+    static int diffCount(int[] a, int[] b) {
+        int n = 0;
+        for (int i = 0; i < a.length; i++) if (a[i] != b[i]) n++;
+        return n;
+    }
+
+    /** Le o retangulo (x,y,w,h) ja recortado do framebuffer de desenho atual e devolve a grade amostrada (preserva pack alignment, PBO de pack e read fb). */
+    static int[] uiRead(int x, int y, int w, int h, int nx, int ny) {
+        int need = w * h * 4;
+        if (uiPix == null || uiPix.capacity() < need) uiPix = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder());
+        int drawFb = gi(0x8CA6), readFb = gi(0x8CAA), pbo = gi(0x88ED), align = gi(0x0D05);
+        try {
+            if (readFb != drawFb) GL30.glBindFramebuffer(0x8CA8, drawFb);
+            if (pbo != 0) GL15.glBindBuffer(0x88EB, 0);
+            GL11.glPixelStorei(0x0D05, 1);
+            uiPix.clear();
+            GL11.glReadPixels(x, y, w, h, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, uiPix);
+            return gridSample(uiPix, w, h, nx, ny);
+        } finally {
+            GL11.glPixelStorei(0x0D05, align);
+            if (pbo != 0) GL15.glBindBuffer(0x88EB, pbo);
+            if (readFb != drawFb) GL30.glBindFramebuffer(0x8CA8, readFb);
+        }
+    }
+
+    public static String uiFrameLine(long f, String t, int mx, int my, int sig, int changed, int of, int x, int y, int w, int h) {
+        return "f=" + f + " t=" + t + " mx=" + mx + " my=" + my + " sig=" + sig + " changed=" + changed + " of=" + of + " rect=" + x + "," + y + "," + w + "," + h;
+    }
+
+    static String uiSecLine(String t, long frames, long moved, long fail, Map<Integer, Long> sigs) {
+        StringBuilder sb = new StringBuilder("{");
+        for (Map.Entry<Integer, Long> en : sigs.entrySet()) { if (sb.length() > 1) sb.append(','); sb.append(en.getKey()).append(':').append(en.getValue()); }
+        return "SEC t=" + t + " frames=" + frames + " mouseMoved=" + moved + " fail=" + fail + " sigs=" + sb.append('}');
+    }
+
+    /** No lugar de AnimatedModel.DoRender(IIIIFF)V (chamado de UI3DModel$Drawer.render). Chama o original exatamente 1 vez, aconteca o que acontecer. */
+    public static void uiDoRender(zombie.core.skinnedmodel.advancedanimation.AnimatedModel am, int x, int y, int w, int h, float size, float angle) {
+        int sig = -1, nx = 0, ny = 0, cx = 0, cy = 0, cw = 0, ch = 0;
+        int[] before = null;
+        try {
+            String st = uiState();
+            synchronized (uiSigs) {
+                Integer id = uiSigs.get(st);
+                if (id == null) { id = uiSigs.size() + 1; uiSigs.put(st, id); umlog("SIG id=" + id + " " + st); }
+                sig = id;
+            }
+            String[] p = st.substring(st.indexOf(" vp=") + 4).split(" ")[0].split(",");
+            int vx = Integer.parseInt(p[0]), vy = Integer.parseInt(p[1]), vw = Integer.parseInt(p[2]), vh = Integer.parseInt(p[3]);
+            int x0 = Math.max(x, vw > 0 ? vx : 0), y0 = Math.max(y, vh > 0 ? vy : 0);
+            int x1 = Math.min(x + w, vw > 0 ? vx + vw : Integer.MAX_VALUE), y1 = Math.min(y + h, vh > 0 ? vy + vh : Integer.MAX_VALUE);
+            cx = x0; cy = y0; cw = x1 - x0; ch = y1 - y0;
+            if (cw > 0 && ch > 0 && (long) cw * ch <= 16_000_000L) {
+                nx = Math.min(64, cw); ny = Math.min(64, ch);
+                before = uiRead(cx, cy, cw, ch, nx, ny);
+            }
+        } catch (Throwable t) { uiErr++; before = null; }
+        am.DoRender(x, y, w, h, size, angle);
+        try {
+            int changed = 0, of = 0;
+            if (before != null) { int[] after = uiRead(cx, cy, cw, ch, nx, ny); changed = diffCount(before, after); of = before.length; }
+            int mx = -1, my = -1;
+            try { mx = zombie.input.Mouse.getX(); my = zombie.input.Mouse.getY(); } catch (Throwable ignored) { }
+            long now = System.nanoTime();
+            if (uiSecStart == 0) uiSecStart = now;
+            uiFrame++; uiSecFrames++;
+            if (mx != uiPrevMx || my != uiPrevMy) { if (uiPrevMx != Integer.MIN_VALUE) uiSecMoved++; uiPrevMx = mx; uiPrevMy = my; }
+            if (changed > uiMaxChanged) uiMaxChanged = changed;
+            if (changed * 5L < uiMaxChanged) uiSecFail++;
+            uiSecSigs.merge(sig, 1L, Long::sum);
+            String t = LocalDateTime.now().format(UI_MS);
+            umlog(uiFrameLine(uiFrame, t, mx, my, sig, changed, of, x, y, w, h));
+            if (now - uiSecStart >= 1_000_000_000L) {
+                umlog(uiSecLine(t, uiSecFrames, uiSecMoved, uiSecFail, uiSecSigs));
+                try { uiModelLog.flush(); } catch (Throwable ignored) { }
+                uiSecStart = now; uiSecFrames = uiSecMoved = uiSecFail = 0; uiSecSigs.clear();
+            }
+        } catch (Throwable t) { uiErr++; }
+    }
+
+    // ------------------------------------------------------------------ glsync
+    static final String SWAP_CLASS = "org/lwjglx/opengl/Display";
+    static boolean syncSwapFinish, syncSwapFlush, syncModelFinish, syncModelFlush, syncSwapFence, fpsOn;
+    // swapfence: fence atrasado de 1 quadro (so a thread de render usa fenceHandle)
+    static long fenceHandle;
+    static final AtomicLong gsSwapFence = new AtomicLong(), gsFenceWaitNs = new AtomicLong();
+    static final AtomicLong gsSwapFinish = new AtomicLong(), gsSwapFlush = new AtomicLong(), gsModelFinish = new AtomicLong(), gsModelFlush = new AtomicLong();
+
+    static void parseGlSync(String v) {
+        switch (v) {
+            case "swapfinish": syncSwapFinish = true; break;
+            case "swapflush": syncSwapFlush = true; break;
+            case "swapfence": syncSwapFence = true; break;
+            case "modelfinish": syncModelFinish = true; break;
+            case "modelflush": syncModelFlush = true; break;
+            case "uploadfinish": upFinishOn = true; break;
+            case "uploadflush": upFlushOn = true; break;
+            case "uploadcount": upCountOn = true; break;
+            case "uploadflushall": upFlushAllOn = true; break;
+            case "uploadfinishall": upFinishAllOn = true; break;
+            case "otherflush": otherFlushOn = true; break;
+            case "otherfinish": otherFinishOn = true; break;
+            case "clearfinish": clearFinishOn = true; break;
+            case "clearflush": clearFlushOn = true; break;
+            default: fatal("glsync invalido (swapfinish|swapflush|swapfence|modelfinish|modelflush|uploadfinish|uploadflush|uploadfinishall|uploadflushall|uploadcount|otherflush|otherfinish|clearfinish|clearflush): " + v, new IllegalArgumentException(v));
+        }
+    }
+
+    static String glSyncDesc() {
+        List<String> l = new ArrayList<>();
+        if (syncSwapFinish) l.add("swapfinish");
+        if (syncSwapFlush) l.add("swapflush");
+        if (syncSwapFence) l.add("swapfence");
+        if (syncModelFinish) l.add("modelfinish");
+        if (syncModelFlush) l.add("modelflush");
+        if (upFinishOn) l.add("uploadfinish");
+        if (upFlushOn) l.add("uploadflush");
+        if (upFinishAllOn) l.add("uploadfinishall");
+        if (upFlushAllOn) l.add("uploadflushall");
+        if (upCountOn) l.add("uploadcount");
+        if (otherFlushOn) l.add("otherflush");
+        if (otherFinishOn) l.add("otherfinish");
+        if (clearFinishOn) l.add("clearfinish");
+        if (clearFlushOn) l.add("clearflush");
+        return String.join(",", l);
+    }
+
+    // tamanho do framebuffer/janela do handle do swap (so a thread de render usa)
+    static final int[] fbW = new int[1], fbH = new int[1], wW = new int[1], wH = new int[1];
+    static int lastFbW = -1, lastFbH = -1, lastWW = -1, lastWH = -1;
+    static volatile Path glSyncLogPath;
+
+    static String fbLine(int fw, int fh, int ww, int wh) { return "framebuffer=" + fw + "x" + fh + " janela=" + ww + "x" + wh; }
+
+    /** Chamado a cada swap (de FpsCounter.swap ou de swapSync): na 1a vez e sempre que framebuffer/janela mudam, imprime em stderr
+     *  "[pzarm-agent] framebuffer=WxH janela=WxH" e grava "# t=... framebuffer=.. janela=.." no glsync.log (se existir) ou no csv de fps. Nunca lanca. */
+    public static void fbInfo(long window) {
+        try {
+            org.lwjgl.glfw.GLFW.glfwGetFramebufferSize(window, fbW, fbH);
+            org.lwjgl.glfw.GLFW.glfwGetWindowSize(window, wW, wH);
+            if (fbW[0] == lastFbW && fbH[0] == lastFbH && wW[0] == lastWW && wH[0] == lastWH) return;
+            lastFbW = fbW[0]; lastFbH = fbH[0]; lastWW = wW[0]; lastWH = wH[0];
+            String l = fbLine(lastFbW, lastFbH, lastWW, lastWH);
+            System.err.println("[pzarm-agent] " + l);
+            String c = "# t=" + LocalDateTime.now().format(UI_MS) + " " + l;
+            Path p = glSyncLogPath;
+            if (p != null) Files.writeString(p, c + "\n", StandardOpenOption.APPEND);
+            else FpsCounter.comment(c);
+        } catch (Throwable ignored) { }
+    }
+
+    static void installGlSync(Instrumentation inst, Path dir) {
+        Path log = dir.toAbsolutePath().resolve("glsync.log");
+        try {
+            Files.createDirectories(log.getParent());
+            Files.writeString(log, "# pzarm-agent glsync " + LocalDateTime.now() + " " + glSyncDesc() + "\n# t swapFinish swapFlush modelFinish modelFlush [upFinish upFlush clearFinish clearFlush calls skipped otherFlush otherFinish others] [swapFence fenceWaitMs] (contagens do ultimo segundo; colchetes so com upload/clear/other ou swapfence ativos)\n");
+        } catch (IOException e) { fatal("nao foi possivel criar " + log, e); }
+        glSyncLogPath = log;
+        final boolean swap = true, model = syncModelFinish || syncModelFlush;   // o hook do swap sempre entra: captura a thread de render
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                try {
+                    if (swap && SWAP_CLASS.equals(name)) return instrumentSwap(buf);
+                    if (model && UI_CLASS.equals(name)) return instrumentModelSync(buf);
+                } catch (Throwable t) { fatal("falha ao transformar " + name, t); }
+                return null;
+            }
+        });
+        if (uploadActive()) {
+            inst.addTransformer(new ClassFileTransformer() {
+                @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                    if (name == null || !upPrefix(name)) return null;
+                    try {
+                        long[] sites = new long[SITES_N];
+                        byte[] out = instrumentUpload(buf, sites);
+                        if (out == null) return null;
+                        for (int i = 0; i < SITES_N; i++) upSites.addAndGet(i, sites[i]);
+                        if (upClasses.incrementAndGet() % 1000 == 0) upReport();
+                        return out;
+                    } catch (Throwable t) {
+                        System.err.println("[pzarm-agent] aviso: uploadsync nao transformou " + name + ": " + t);
+                        return null;
+                    }
+                }
+            });
+        }
+        Thread t = new Thread(() -> glSyncWriter(log), "pzarm-glsync");
+        t.setDaemon(true);
+        t.start();
+        System.err.println("[pzarm-agent] modo glsync ativo: " + glSyncDesc());
+    }
+
+    static void glSyncWriter(Path log) {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss");
+        long[] prev = new long[11], prevCalls = new long[UP_N];
+        long prevFence = 0, prevFenceNs = 0;
+        while (true) {
+            try {
+                Thread.sleep(1000);
+                long[] cur = {gsSwapFinish.get(), gsSwapFlush.get(), gsModelFinish.get(), gsModelFlush.get(), gsUpFinish.get(), gsUpFlush.get(), gsClearFinish.get(), gsClearFlush.get(), gsSkipped.get(), gsOtherFlush.get(), gsOtherFinish.get()};
+                String t = LocalDateTime.now().format(fmt);
+                String line;
+                if (uploadActive()) {
+                    long[] calls = new long[UP_N];
+                    for (int i = 0; i < UP_N; i++) calls[i] = upCalls.get(i);
+                    line = glSyncLine(t, cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2], cur[3] - prev[3], cur[4] - prev[4], cur[5] - prev[5], cur[6] - prev[6], cur[7] - prev[7],
+                            upCallsDesc(calls, prevCalls), cur[8] - prev[8], cur[9] - prev[9], cur[10] - prev[10], othersDesc());
+                    prevCalls = calls;
+                } else line = glSyncLine(t, cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2], cur[3] - prev[3]);
+                prev = cur;
+                if (syncSwapFence) {
+                    long fc = gsSwapFence.get(), fw = gsFenceWaitNs.get();
+                    line += " swapFence=" + (fc - prevFence) + " fenceWaitMs=" + String.format(java.util.Locale.ROOT, "%.1f", (fw - prevFenceNs) / 1e6);
+                    prevFence = fc; prevFenceNs = fw;
+                }
+                Files.writeString(log, line + "\n", StandardOpenOption.APPEND);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    static String glSyncLine(String t, long swapFinish, long swapFlush, long modelFinish, long modelFlush) {
+        return "t=" + t + " swapFinish=" + swapFinish + " swapFlush=" + swapFlush + " modelFinish=" + modelFinish + " modelFlush=" + modelFlush;
+    }
+
+    /** org.lwjglx.opengl.Display: cada chamada a GLFW.glfwSwapBuffers(J)V (ou, com o modo fps ja instalado antes, a FpsCounter.swap(J)V que a substituiu)
+     *  vira PzArmAgent.swapSync(J)V, que faz glFlush/glFinish e depois chama FpsCounter.swap (fps ativo) ou GLFW.glfwSwapBuffers. Pelo menos 1 troca, senao fatal(). */
+    static byte[] instrumentSwap(byte[] bytes) {
+        ClassFile cf = ClassFile.of();
+        int[] n = {0};
+        ClassDesc me = ClassDesc.of(ME);
+        CodeTransform ct = (CodeBuilder b, CodeElement e) -> {
+            if (e instanceof InvokeInstruction ii && ii.opcode() == Opcode.INVOKESTATIC && ii.type().equalsString("(J)V")
+                    && ((ii.owner().asInternalName().equals("org/lwjgl/glfw/GLFW") && ii.name().equalsString("glfwSwapBuffers"))
+                        || (ii.owner().asInternalName().equals("FpsCounter") && ii.name().equalsString("swap")))) {
+                b.invokestatic(me, "swapSync", MethodTypeDesc.ofDescriptor("(J)V"));
+                n[0]++;
+            } else b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(ct));
+        if (n[0] < 1) throw new IllegalStateException("nenhuma chamada a glfwSwapBuffers em " + SWAP_CLASS);
+        return out;
+    }
+
+    /** UI3DModel$Drawer.render()V: logo depois da unica chamada a AnimatedModel.DoRender(IIIIFF)V (ou a PzArmAgent.uiDoRender, se o uimodeldiag a trocou antes)
+     *  insere PzArmAgent.modelSync()V. Exatamente 1, senao fatal(). */
+    static byte[] instrumentModelSync(byte[] bytes) {
+        ClassFile cf = ClassFile.of();
+        int[] n = {0};
+        ClassDesc me = ClassDesc.of(ME);
+        CodeTransform ct = (CodeBuilder b, CodeElement e) -> {
+            b.with(e);
+            if (e instanceof InvokeInstruction ii && ((ii.opcode() == Opcode.INVOKEVIRTUAL && ii.owner().asInternalName().equals(AM_CLASS)
+                        && ii.name().equalsString("DoRender") && ii.type().equalsString("(IIIIFF)V"))
+                    || (ii.opcode() == Opcode.INVOKESTATIC && ii.owner().asInternalName().equals(ME) && ii.name().equalsString("uiDoRender")))) {
+                b.invokestatic(me, "modelSync", MethodTypeDesc.ofDescriptor("()V"));
+                n[0]++;
+            }
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("render") && mm.methodType().equalsString("()V"), ct));
+        if (n[0] != 1) throw new IllegalStateException("esperava 1 chamada a AnimatedModel.DoRender em UI3DModel$Drawer.render, achei " + n[0]);
+        return out;
+    }
+
+    /** No lugar de glfwSwapBuffers (via Display). */
+    public static void swapSync(long window) {
+        if (renderThread == null) { renderThread = Thread.currentThread(); if (uploadActive()) upReport(); }
+        if (stutterOn) stutterFrame();
+        long fa = stutterOn ? System.nanoTime() : 0;
+        try {
+            if (syncSwapFlush) { GL11.glFlush(); gsSwapFlush.incrementAndGet(); }
+            if (syncSwapFinish) { GL11.glFinish(); gsSwapFinish.incrementAndGet(); }
+            if (syncSwapFence && fenceHandle != 0) {   // fence do quadro anterior: so bloqueia se a GPU atrasou mais de 1 quadro
+                long w0 = System.nanoTime();
+                GL32.glClientWaitSync(fenceHandle, GL32.GL_SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000L);
+                gsFenceWaitNs.addAndGet(System.nanoTime() - w0);
+                GL32.glDeleteSync(fenceHandle);
+                fenceHandle = 0;
+            }
+        } catch (Throwable ignored) { fenceHandle = 0; }
+        if (fa != 0) stFinishNs = System.nanoTime() - fa;
+        if (fpsOn) FpsCounter.swap(window); else { fbInfo(window); org.lwjgl.glfw.GLFW.glfwSwapBuffers(window); }
+        if (syncSwapFence) {
+            try { fenceHandle = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0); gsSwapFence.incrementAndGet(); } catch (Throwable ignored) { fenceHandle = 0; }
+        }
+        gpuDirty = false;   // a troca de buffers ja envia o que estava pendente
+    }
+
+    /** Logo depois do desenho do boneco do menu. */
+    public static void modelSync() {
+        try {
+            if (syncModelFlush) { GL11.glFlush(); gsModelFlush.incrementAndGet(); }
+            if (syncModelFinish) { GL11.glFinish(); gsModelFinish.incrementAndGet(); }
+        } catch (Throwable ignored) { }
+    }
+
+    // ------------------------------------------------------------------ glsync: upload*/clear*
+    static final String[] UP_NAMES = {"glTexSubImage2D", "glTexSubImage3D", "glTexImage2D", "glTexImage3D", "glCompressedTexSubImage2D", "glCompressedTexImage2D",
+        "glCopyTexSubImage2D", "glCopyTexImage2D", "glBufferSubData", "glBufferData", "glMapBuffer", "glMapBufferRange", "glUnmapBuffer", "glGenerateMipmap",
+        "glGenerateMipmapEXT", "glBlitFramebuffer", "glBlitFramebufferEXT", "glClear",
+        "IGLBufferObject.glBufferData", "IGLBufferObject.glBufferSubData", "IGLBufferObject.glMapBuffer", "IGLBufferObject.glUnmapBuffer"};
+    static final int UP_N = UP_NAMES.length, UP_CLEAR = 17;
+    static final String[] GW_NAMES = {"glDrawArrays", "glDrawElements", "glDrawRangeElements", "glDrawArraysInstanced", "glDrawElementsInstanced", "glMultiDrawArrays",
+        "glMultiDrawElements", "glClear", "glBlitFramebuffer", "glCopyTexSubImage2D", "glCopyTexImage2D", "glBegin"};
+    static final int GW_N = GW_NAMES.length, SITES_N = UP_N + GW_N;
+    static final String[] SITE_NAMES = new String[SITES_N];
+    static final Map<String, Integer> GW_IDS = new java.util.HashMap<>();
+    static {
+        for (int i = 0; i < UP_N; i++) SITE_NAMES[i] = UP_NAMES[i];
+        for (int i = 0; i < GW_N; i++) { SITE_NAMES[UP_N + i] = "gpuWork." + GW_NAMES[i]; GW_IDS.put(GW_NAMES[i], i); }
+    }
+    static final Map<String, Integer> UP_GL_IDS = new java.util.HashMap<>(), UP_WRAP_IDS = new java.util.HashMap<>();
+    static {
+        for (int i = 0; i < UP_NAMES.length; i++) {
+            if (UP_NAMES[i].startsWith("IGLBufferObject.")) UP_WRAP_IDS.put(UP_NAMES[i].substring(16), i); else UP_GL_IDS.put(UP_NAMES[i], i);
+        }
+    }
+    static final String WRAP_OWNER = "zombie/core/VBO/IGLBufferObject";
+    static final byte[] UP_NEEDLE_GL = "org/lwjgl/opengl/".getBytes(StandardCharsets.US_ASCII), UP_NEEDLE_WRAP = "IGLBufferObject".getBytes(StandardCharsets.US_ASCII),
+            UP_NEEDLE_ME = "PzArmAgent".getBytes(StandardCharsets.US_ASCII);
+    static boolean upFinishOn, upFlushOn, upCountOn, clearFinishOn, clearFlushOn, upFlushAllOn, upFinishAllOn, otherFlushOn, otherFinishOn;
+    static boolean gpuDirty;   // so a thread de render: houve desenho/clear/blit/copia desde o ultimo flush/finish/swap
+    static volatile Thread renderThread;
+    static final java.util.concurrent.atomic.AtomicLongArray upCalls = new java.util.concurrent.atomic.AtomicLongArray(UP_N), upSites = new java.util.concurrent.atomic.AtomicLongArray(SITES_N);
+    static final AtomicLong gsUpFinish = new AtomicLong(), gsUpFlush = new AtomicLong(), gsClearFinish = new AtomicLong(), gsClearFlush = new AtomicLong(), upClasses = new AtomicLong(),
+            gsSkipped = new AtomicLong(), gsOtherUploads = new AtomicLong(), gsOtherFlush = new AtomicLong(), gsOtherFinish = new AtomicLong();
+
+    static boolean uploadActive() { return upFinishOn || upFlushOn || upCountOn || clearFinishOn || clearFlushOn || upFlushAllOn || upFinishAllOn || otherFlushOn || otherFinishOn; }
+
+    static boolean upPrefix(String name) { return name.startsWith("zombie/") || name.startsWith("org/lwjglx/") || name.startsWith("se/krka/"); }
+
+    static boolean containsBytes(byte[] hay, byte[] needle) {
+        outer:
+        for (int i = 0; i <= hay.length - needle.length; i++) {
+            if (hay[i] != needle[0]) continue;
+            for (int j = 1; j < needle.length; j++) if (hay[i + j] != needle[j]) continue outer;
+            return true;
+        }
+        return false;
+    }
+
+    /** Id (indice em UP_NAMES) da chamada, ou -1. Vale: invokestatic org/lwjgl/opengl/* com nome da lista; invokeinterface/invokevirtual de IGLBufferObject
+     *  (glBufferData, glBufferSubData, glMapBuffer, glUnmapBuffer); e PzArmAgent.mapRange30/mapRangeArb (o vbosync ja trocou glMapBufferRange). */
+    static int upId(InvokeInstruction ii) {
+        String owner = ii.owner().asInternalName(), name = ii.name().stringValue();
+        Integer id = null;
+        if (ii.opcode() == Opcode.INVOKESTATIC) {
+            if (owner.startsWith("org/lwjgl/opengl/")) id = UP_GL_IDS.get(name);
+            else if (owner.equals(ME) && (name.equals("mapRange30") || name.equals("mapRangeArb"))) id = UP_GL_IDS.get("glMapBufferRange");
+        } else if ((ii.opcode() == Opcode.INVOKEINTERFACE || ii.opcode() == Opcode.INVOKEVIRTUAL) && owner.equals(WRAP_OWNER)) id = UP_WRAP_IDS.get(name);
+        return id == null ? -1 : id;
+    }
+
+    static int gwId(InvokeInstruction ii) {
+        if (ii.opcode() != Opcode.INVOKESTATIC || !ii.owner().asInternalName().startsWith("org/lwjgl/opengl/")) return -1;
+        Integer g = GW_IDS.get(ii.name().stringValue());
+        return g == null ? -1 : g;
+    }
+
+    /** Insere, em cada chamada de upload/copia/clear do GL, invokestatic PzArmAgent.preUpload(I)V (constante do id) ANTES e postUpload(I)V DEPOIS (nao mexem na pilha),
+     *  e invokestatic PzArmAgent.gpuWork()V ANTES de cada chamada de desenho/clear/blit/copia/glBegin (GW_NAMES). sites[id] = pontos de preUpload (== postUpload);
+     *  sites[UP_N + g] = pontos de gpuWork do nome g. Devolve null se a classe nao tem pontos. */
+    static byte[] instrumentUpload(byte[] bytes, long[] sites) {
+        if (!containsBytes(bytes, UP_NEEDLE_GL) && !containsBytes(bytes, UP_NEEDLE_WRAP) && !containsBytes(bytes, UP_NEEDLE_ME)) return null;
+        ClassFile cf = ClassFile.of();
+        int[] n = {0};
+        ClassDesc me = ClassDesc.of(ME);
+        MethodTypeDesc d = MethodTypeDesc.ofDescriptor("(I)V"), v = MethodTypeDesc.ofDescriptor("()V");
+        CodeTransform ct = (CodeBuilder b, CodeElement e) -> {
+            int id = -1;
+            if (e instanceof InvokeInstruction ii) {
+                id = upId(ii);
+                if (id >= 0) { b.loadConstant(id); b.invokestatic(me, "preUpload", d); sites[id]++; n[0]++; }
+                int gw = gwId(ii);
+                if (gw >= 0) { b.invokestatic(me, "gpuWork", v); sites[UP_N + gw]++; n[0]++; }
+            }
+            b.with(e);
+            if (id >= 0) { b.loadConstant(id); b.invokestatic(me, "postUpload", d); }
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(ct));
+        return n[0] == 0 ? null : out;
+    }
+
+    static String upSitesDesc() {
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < SITES_N; i++) if (upSites.get(i) != 0) { if (sb.length() > 1) sb.append(','); sb.append(SITE_NAMES[i]).append(':').append(upSites.get(i)); }
+        return sb.append('}').toString();
+    }
+
+    static void upReport() { System.err.println("[pzarm-agent] uploadsync: classes=" + upClasses.get() + " pontos=" + upSitesDesc()); }
+
+    /** Chamado (bytecode injetado) antes de cada upload/copia/clear. Na thread de render capturada no 1o swap: conta e sincroniza (uploadflush/uploadfinish so se houve
+     *  trabalho de GPU desde o ultimo flush/finish/swap, ver gpuWork; as variantes *all sempre). Em outras threads so conta por thread (otherUpload). Nunca lanca. */
+    public static void preUpload(int id) {
+        try {
+            Thread rt = renderThread;
+            if (rt == null || Thread.currentThread() != rt) { otherUpload(id); return; }
+            upCalls.incrementAndGet(id);
+            boolean fin, fl, flAll, finAll;
+            if (id == UP_CLEAR) { fin = clearFinishOn; fl = clearFlushOn; flAll = finAll = true; }
+            else { fin = upFinishOn || upFinishAllOn; fl = upFlushOn || upFlushAllOn; flAll = upFlushAllOn; finAll = upFinishAllOn; }
+            long ta = stutterOn && (fl || fin) ? System.nanoTime() : 0;
+            if (stutterOn) stUploads++;
+            if (fl) {
+                if (flAll || gpuDirty) { GL11.glFlush(); gpuDirty = false; (id == UP_CLEAR ? gsClearFlush : gsUpFlush).incrementAndGet(); if (id != UP_CLEAR) stFlushDone++; }
+                else { gsSkipped.incrementAndGet(); stFlushSkipped++; }
+            }
+            if (fin) {
+                if (finAll || gpuDirty) { GL11.glFinish(); gpuDirty = false; (id == UP_CLEAR ? gsClearFinish : gsUpFinish).incrementAndGet(); if (id != UP_CLEAR) stFlushDone++; }
+                else { gsSkipped.incrementAndGet(); stFlushSkipped++; }
+            }
+            if (ta != 0) stUpNs += System.nanoTime() - ta;
+        } catch (Throwable ignored) { }
+    }
+
+    /** Chamado (bytecode injetado) antes de cada chamada de desenho/clear/blit/copia/glBegin: marca que a thread de render tem trabalho de GPU ainda nao enviado. */
+    public static void gpuWork() { if (Thread.currentThread() == renderThread) gpuDirty = true; }
+
+    /** Estatistica por thread que nao e a de render (so o dono escreve; o writer do glsync.log le sem trava). */
+    static final class ThreadStat {
+        final Thread thread = Thread.currentThread();
+        final String name = thread.getName();
+        final long[] perId = new long[UP_N], prevPerId = new long[UP_N];
+        long total, prevTotal, flush;
+        int ctx, since;   // ctx: 0 desconhecido, 1 tem contexto GL atual, 2 nao tem
+    }
+    static final java.util.concurrent.CopyOnWriteArrayList<ThreadStat> TSTATS = new java.util.concurrent.CopyOnWriteArrayList<>();
+    static final ThreadLocal<ThreadStat> TSTAT = ThreadLocal.withInitial(() -> { ThreadStat s = new ThreadStat(); TSTATS.add(s); return s; });
+
+    static void otherUpload(int id) {
+        ThreadStat s = TSTAT.get();
+        s.perId[id]++; s.total++;
+        gsOtherUploads.incrementAndGet();
+    }
+
+    /** Chamado (bytecode injetado) DEPOIS de cada chamada de upload da lista (nao mexe na pilha). So age em thread que nao e a de render e que tem contexto GL atual
+     *  (glfwGetCurrentContext, em cache por thread e reavaliado a cada 2048 chamadas): otherflush/otherfinish. */
+    public static void postUpload(int id) {
+        try {
+            if (!otherFlushOn && !otherFinishOn) return;
+            Thread rt = renderThread;
+            if (rt == null || Thread.currentThread() == rt) return;
+            ThreadStat s = TSTAT.get();
+            if (s.ctx == 0 || ++s.since >= 2048) { s.ctx = org.lwjgl.glfw.GLFW.glfwGetCurrentContext() != 0 ? 1 : 2; s.since = 0; }
+            if (s.ctx != 1) return;
+            if (otherFlushOn) { GL11.glFlush(); gsOtherFlush.incrementAndGet(); s.flush++; }
+            if (otherFinishOn) { GL11.glFinish(); gsOtherFinish.incrementAndGet(); }
+        } catch (Throwable ignored) { }
+    }
+
+    /** Por segundo: threads != render que chamaram preUpload: {nome:n(idMaisFrequente),...}. Remove da lista as threads mortas sem atividade. */
+    static String othersDesc() {
+        StringBuilder sb = new StringBuilder("{");
+        for (ThreadStat s : TSTATS) {
+            long d = s.total - s.prevTotal;
+            if (d != 0) {
+                int top = -1; long topN = 0;
+                for (int i = 0; i < UP_N; i++) { long di = s.perId[i] - s.prevPerId[i]; if (di > topN) { topN = di; top = i; } s.prevPerId[i] = s.perId[i]; }
+                s.prevTotal = s.total;
+                if (sb.length() > 1) sb.append(',');
+                sb.append(s.name).append(':').append(d).append('(').append(top >= 0 ? UP_NAMES[top] : "?").append(')');
+            } else if (!s.thread.isAlive()) TSTATS.remove(s);
+        }
+        return sb.append('}').toString();
+    }
+
+    static String upCallsDesc(long[] cur, long[] prev) {
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < UP_N; i++) { long d = cur[i] - prev[i]; if (d != 0) { if (sb.length() > 1) sb.append(','); sb.append(UP_NAMES[i]).append(':').append(d); } }
+        return sb.append('}').toString();
+    }
+
+    static String glSyncLine(String t, long swapFinish, long swapFlush, long modelFinish, long modelFlush, long upFinish, long upFlush, long clearFinish, long clearFlush, String calls,
+            long skipped, long otherFlush, long otherFinish, String others) {
+        return glSyncLine(t, swapFinish, swapFlush, modelFinish, modelFlush) + " upFinish=" + upFinish + " upFlush=" + upFlush
+                + " clearFinish=" + clearFinish + " clearFlush=" + clearFlush + " calls=" + calls + " skipped=" + skipped
+                + " otherFlush=" + otherFlush + " otherFinish=" + otherFinish + " others=" + others;
+    }
+
+    // ------------------------------------------------------------------ stutterdiag
+    static boolean stutterOn;
+    static long stutterNs = 45_000_000L;
+    static BufferedWriter stutterLog;
+    // so a thread de render escreve/le (swapSync, preUpload, chunkEnter/chunkExit)
+    static long stLastEntry, stFinishNs, stUpNs, stUploads, stChunks, stChunkNs, stChunkStart, stSumStart;
+    static long stFrames, stSlow, stSlowSumNs, stSlowChunks, stSlowGc, stSlowFinish, stSlowWait;
+    static long stPrevGcCount, stPrevGcMs, stFlushDone, stFlushSkipped, stPrevOtherUp, stPrevOtherFl;
+    static java.util.List<java.lang.management.GarbageCollectorMXBean> stGcBeans;
+
+    static void installStutter(Instrumentation inst, Path dir) {
+        Path log = dir.toAbsolutePath().resolve("stutter.log");
+        try {
+            Files.createDirectories(log.getParent());
+            stutterLog = Files.newBufferedWriter(log, StandardCharsets.UTF_8);
+            stlog("# pzarm-agent stutterdiag " + LocalDateTime.now() + " stutterms=" + stutterNs / 1_000_000L);
+            stlog("# t frameMs finishMs uploadSyncMs uploads chunks chunkMs gcCount gcMs mainWaitMs flushDone flushSkipped otherUploads otherFlush | SUM a cada 10 s");
+            stutterLog.flush();
+            stGcBeans = java.lang.management.ManagementFactory.getGarbageCollectorMXBeans();
+        } catch (IOException e) { fatal("nao foi possivel criar " + log, e); }
+        stutterOn = true;
+        if (!fxChunk) {   // com renderfix *chunk o instrumentChunk ja foi instalado (evita inserir chunkEnter/chunkExit duas vezes)
+            inst.addTransformer(new ClassFileTransformer() {
+                @Override public byte[] transform(ClassLoader l, String name, Class<?> c, ProtectionDomain pd, byte[] buf) {
+                    if (!FC_CLASS.equals(name)) return null;
+                    try { return instrumentChunk(buf); }
+                    catch (Throwable t) { fatal("falha ao transformar " + name, t); return null; }
+                }
+            });
+        }
+        System.err.println("[pzarm-agent] modo stutterdiag ativo: stutterms=" + stutterNs / 1_000_000L + " log: " + log);
+    }
+
+    static void stlog(String s) { try { stutterLog.write(s); stutterLog.newLine(); } catch (Throwable ignored) { } }
+
+    static String ms1(long ns) { return String.format(java.util.Locale.ROOT, "%.1f", ns / 1e6); }
+
+    static String stutterLine(String t, long frameNs, long finishNs, long upNs, long uploads, long chunks, long chunkNs, long gcCount, long gcMs, long waitNs,
+            long flushDone, long flushSkipped, long otherUploads, long otherFlush) {
+        return "t=" + t + " frameMs=" + ms1(frameNs) + " finishMs=" + ms1(finishNs) + " uploadSyncMs=" + ms1(upNs) + " uploads=" + uploads + " chunks=" + chunks
+                + " chunkMs=" + ms1(chunkNs) + " gcCount=" + gcCount + " gcMs=" + gcMs + " mainWaitMs=" + ms1(waitNs)
+                + " flushDone=" + flushDone + " flushSkipped=" + flushSkipped + " otherUploads=" + otherUploads + " otherFlush=" + otherFlush;
+    }
+
+    static String stutterSum(String t, long frames, long slow, long slowSumNs, long withChunks, long withGc, long finishDom, long waitDom) {
+        return "SUM t=" + t + " frames=" + frames + " slow=" + slow + " avgSlowMs=" + ms1(slow > 0 ? slowSumNs / slow : 0) + " slowWithChunks=" + withChunks
+                + " slowWithGc=" + withGc + " slowFinishDominant=" + finishDom + " slowMainWaitDominant=" + waitDom;
+    }
+
+    /** Chamado no inicio de cada swapSync (thread de render): fecha o intervalo desde o swap anterior, registra se lento e zera os acumuladores. */
+    static void stutterFrame() {
+        try {
+            long now = System.nanoTime();
+            if (stSumStart == 0) stSumStart = now;
+            if (stLastEntry != 0) {
+                long dt = now - stLastEntry;
+                stFrames++;
+                // GC: 1 leitura por quadro (soma de contagem e tempo de todos os coletores; barato, sao 2 beans no ZGC)
+                long gcc = 0, gcm = 0;
+                for (java.lang.management.GarbageCollectorMXBean b : stGcBeans) { long c = b.getCollectionCount(), m = b.getCollectionTime(); if (c > 0) gcc += c; if (m > 0) gcm += m; }
+                long dGc = gcc - stPrevGcCount, dGcMs = gcm - stPrevGcMs;
+                stPrevGcCount = gcc; stPrevGcMs = gcm;
+                long ou = gsOtherUploads.get(), ofl = gsOtherFlush.get() + gsOtherFinish.get();
+                long dOu = ou - stPrevOtherUp, dOfl = ofl - stPrevOtherFl;
+                stPrevOtherUp = ou; stPrevOtherFl = ofl;
+                if (dt >= stutterNs) {
+                    long wait = 0;
+                    try { wait = zombie.core.opengl.RenderThread.getWaitTime(); } catch (Throwable ignored) { }
+                    stSlow++; stSlowSumNs += dt;
+                    if (stChunks > 0) stSlowChunks++;
+                    if (dGc > 0) stSlowGc++;
+                    if (stFinishNs * 2 > dt) stSlowFinish++;
+                    if (wait * 2 > dt) stSlowWait++;
+                    stlog(stutterLine(LocalDateTime.now().format(UI_MS), dt, stFinishNs, stUpNs, stUploads, stChunks, stChunkNs, dGc, dGcMs, wait, stFlushDone, stFlushSkipped, dOu, dOfl));
+                    stutterLog.flush();
+                }
+            }
+            stFinishNs = stUpNs = stUploads = stChunks = stChunkNs = stFlushDone = stFlushSkipped = 0; stChunkStart = 0;
+            stLastEntry = now;
+            if (now - stSumStart >= 10_000_000_000L) {
+                stlog(stutterSum(LocalDateTime.now().format(UI_MS), stFrames, stSlow, stSlowSumNs, stSlowChunks, stSlowGc, stSlowFinish, stSlowWait));
+                stutterLog.flush();
+                stSumStart = now; stFrames = stSlow = stSlowSumNs = stSlowChunks = stSlowGc = stSlowFinish = stSlowWait = 0;
+            }
+        } catch (Throwable ignored) { }
     }
 
     // ------------------------------------------------------------------ renderdiag / renderfix
@@ -391,10 +1317,16 @@ public final class PzArmAgent {
     }
 
     /** Chamado (bytecode injetado) quando a thread de render comeca a desenhar um chunk no proprio FBO. */
-    public static void chunkEnter() { inChunk = true; lastT0 = lastT1 = -1; }
+    public static void chunkEnter() {
+        inChunk = true; lastT0 = lastT1 = -1;
+        if (stutterOn && Thread.currentThread() == renderThread) { stChunks++; stChunkStart = System.nanoTime(); }
+    }
 
     /** Chamado (bytecode injetado) quando a thread de render termina o chunk. */
-    public static void chunkExit() { inChunk = false; }
+    public static void chunkExit() {
+        inChunk = false;
+        if (stutterOn && stChunkStart != 0 && Thread.currentThread() == renderThread) { stChunkNs += System.nanoTime() - stChunkStart; stChunkStart = 0; }
+    }
 
     static synchronized void rlog(String s) {
         try { renderLog.write(s); renderLog.newLine(); renderLog.flush(); } catch (Throwable ignored) { }
@@ -429,6 +1361,7 @@ public final class PzArmAgent {
 
     /** No lugar de GL12.glDrawRangeElements (chamado de RingBuffer.drawElements). Le/ajusta estado so para tileWithDepth/opaqueWithDepth. */
     public static void draw(int mode, int start, int end, int count, int type, long offset) {
+        gpuWork();
         boolean tile = false, flushAfter = false;
         try {
             nDraws++; secDraws++;
