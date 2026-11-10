@@ -14,3 +14,20 @@ Resumo curto das etapas. Os relatórios completos estão em `reports/` (um por e
 | M7 | Reprodutor isolado em OpenGL puro não reproduziu o bug de textura; as hipóteses de `gl_FragDepth` e de anel de VBO foram descartadas. |
 
 Limites: uma máquina, sessões curtas, sem comparação controlada; veja a seção "Limites conhecidos" do README.
+
+Hipótese `vbosync` (descartada como padrão; opção `-VboSync sync`): o `glMapBufferRange` com UNSYNCHRONIZED (acesso 0x26) de `GLVertexBufferObject` no Mesa D3D12 deixa a CPU reescrever vértices que a GPU ainda não consumiu (sprites com textura/UV errados e piscando, com e sem FBO). Com `-VboSync sync` o agente remove o UNSYNCHRONIZED; ele passou a ser o padrão (`sync`) junto com o `glsync=swapfence,uploadflush,otherflush` (ver abaixo).
+
+## Sincronização CPU-GPU (`glsync`)
+
+Causa provável dos sprites com textura errada e do boneco do menu que some: um hazard de sincronização CPU-GPU no Mesa GLon12/D3D12 (o x64 emulado também sofre, então não é do port ARM64). O diagnóstico `uimodeldiag` provou que o jogo desenha o boneco em todo quadro (`render` igual aos swaps) e que, ao forçar a sincronização com dois `glReadPixels` por quadro, o boneco parou de sumir.
+
+Contorno anterior (agora `-GlSync swapfinish`): `glsync=swapfinish`, um `glFinish` imediatamente antes de cada `glfwSwapBuffers`. Em jogo, `-GlSync swapfinish -RenderFix none -VboSync none` eliminou o glitch com FPS mediana 37; a combinação anterior (`swapfinish` + `flushtex` + `vbosync`) deu 19. Custo medido do `glFinish` do `swapfinish`: de 60 para 37 FPS de mediana, numa sessão e num aparelho (sem comparação controlada). Com o `glFinish`, `flushtex` e `vbosync` eram redundantes (`flushtex` volta com `-RenderFix flushtex`; `-GlSync none` desliga o `glsync`).
+
+Padrão atual: `glsync=swapfence,uploadflush,otherflush` + `vbosync=sync`. O `glFinish` do `swapfinish` travava a CPU, porque drenava a GPU a cada quadro. O `swapfence` (fence `glFenceSync`/`glClientWaitSync` atrasado de 1 quadro) restaura a sobreposição CPU/GPU: a espera do fence apareceu perto de zero no overlay da tela, numa sessão curta (observação visual, não registrada no `glsync.log`). Sozinho, ele reintroduz a corrupção de textura, porque o jogo reescreve buffers sem sincronizar; `vbosync=sync` + `uploadflush` + `otherflush` limpam a imagem. Essa configuração foi validada em jogo numa sessão curta, numa máquina, com imagem limpa e FPS percebido como melhor; como o `glsync.log` dessa sessão não foi coletado, não há mediana de FPS medida nem comparação controlada. O `swapfinish` continua selecionável com `-GlSync swapfinish`.
+
+É um contorno, não uma correção do Mesa.
+
+Pendências conhecidas do `glsync`:
+
+- Os uploads feitos pelos wrappers `IGLBufferObject` sincronizam duas vezes: uma no wrapper e outra no `GL15` que ele chama. A configuração validada em jogo (`swapfinish,uploadflush`) foi assim; não alterar sem um novo teste em jogo.
+- O `uimodeldiag` chama `glGetError` ao capturar o estado e, com isso, limpa erros GL pendentes do jogo. É só diagnóstico e não faz parte da configuração padrão.

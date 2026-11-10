@@ -71,16 +71,28 @@ Medido num único aparelho (Surface Pro X, SQ1, 8 GB, Adreno 680), uma sessão c
 
 | Opção | Efeito |
 |---|---|
-| (padrão) | `fboRenderChunk=true`, `renderfix=flushtex` (contorno do bug de textura) e `collapse=player` (a casa à frente não abre de perto) |
+| (padrão) | `fboRenderChunk=true`, `glsync=swapfence,uploadflush,otherflush` (fence atrasado de 1 quadro em vez de `glFinish`; contorno do hazard de sincronização CPU-GPU do Mesa GLon12) com `vbosync=sync`, sem `renderfix`, e `collapse=player` (a casa à frente não abre de perto) |
+| `-GlSync <lista>` | contorno de sincronização CPU-GPU: padrão `swapfence,uploadflush,otherflush`; também `swapfinish` (o `glFinish` antigo, que travava a CPU; custo medido: FPS mediana 60 → 37 numa sessão), `swapflush`, `modelfinish`, `modelflush` etc. (lista separada por vírgula) ou `none` (desliga) |
 | `-NoFboChunk` | volta ao caminho antigo: `fboRenderChunk=false`, sem renderfix e sem collapse. Na percepção parece mais fluido |
 | `-NoCollapseFix` | desliga só o `collapse=player` (a casa volta a abrir de perto) |
-| `-RenderFix <modo>` | troca o contorno de textura (`none`, `flushtex`, `flush`, `rebind`, `uniforms`, `dirty`, `dirtyprog`, `flushchunk`, `flushtexchunk`); veja [docs/RESULTS.md](docs/RESULTS.md) |
+| `-VboSync <modo>` | contorno para buffers mapeados sem sincronizar (`glMapBufferRange` UNSYNCHRONIZED): `sync` (padrão; remove o UNSYNCHRONIZED), `invalidate` (como `sync` e invalida o buffer inteiro) ou `none`. O padrão foi validado só numa sessão curta, numa máquina |
+| `-RenderFix <modo>` | contorno de textura, desligado por padrão (`none`, `flushtex` volta o contorno antigo, `flush`, `rebind`, `uniforms`, `dirty`, `dirtyprog`, `flushchunk`, `flushtexchunk`); veja [docs/RESULTS.md](docs/RESULTS.md) |
 | `-NoSound` | joga sem som |
 | `-NoAgent` | sem o agente Java (nenhum ajuste de renderização) |
 | `-UseFboChunk` | aceito sem efeito (o modo FBO já é o padrão) |
 | `-GameDir`, `-DistDir`, `-CacheDir` | caminhos; `-Timeout <s>`, `-DryRun`, `-Env`, `-PzSet`, `-RenderDiag`, `-DebugGl` para diagnóstico |
 
 A descrição completa está no cabeçalho de `launcher\run-game.ps1`.
+
+## Atalho no Iniciar
+
+`launcher\jogar.ps1` é o seu perfil de inicialização: um bloco de configuração no topo (resolução, limite de FPS e contornos de sincronização) e uma chamada ao `run-game.ps1`; argumentos extras são repassados (por exemplo `-DryRun`). Se o jogo terminar com erro, a janela espera Enter para você ler a mensagem. `launcher\jogar.cmd` faz o mesmo a partir do Explorer.
+
+`launcher\criar-atalho.ps1` cria (ou recria) o atalho `Project Zomboid ARM64` no Menu Iniciar, apontando para o `jogar.ps1` deste repositório:
+
+```powershell
+.\launcher\criar-atalho.ps1
+```
 
 ## Testes
 
@@ -95,7 +107,7 @@ Os testes em `tests/harness/` (Java e PowerShell, um `run-*.ps1` por biblioteca 
 ## Limites conhecidos
 
 - Só solo. Sem multiplayer e sem Steam (o jogo roda com `-nosteam`; sem Workshop e conquistas).
-- O `flushtex` é um **contorno** do bug de textura (sprites com a textura errada) no Mesa D3D12, não uma correção do Mesa. A causa não foi isolada: um reprodutor isolado não reproduziu o problema.
+- O `glsync` padrão (`swapfence,uploadflush,otherflush` + `vbosync=sync`) é um **contorno**, não uma correção do Mesa. A causa provável é um hazard de sincronização CPU-GPU no Mesa GLon12/D3D12 (o x64 emulado também sofre): sprites com a textura errada e o boneco do menu sumindo. O diagnóstico `uimodeldiag` mostrou que o jogo desenha todo quadro e que forçar a sincronização resolve. O padrão troca o `glFinish` (que drenava a GPU e travava a CPU) por um fence atrasado de 1 quadro, que mantém CPU e GPU em paralelo; o `vbosync=sync` e os flushes de upload evitam a corrupção de textura que o fence sozinho deixa voltar. Validado em jogo (imagem limpa, FPS "melhor") apenas numa sessão curta, numa máquina, sem comparação controlada. `-GlSync swapfinish` volta ao `glFinish` antigo (custo medido: FPS mediana de 60 para 37 numa sessão). Um reprodutor isolado em OpenGL puro não reproduziu o problema.
 - No modo FBO (padrão) o jogo pode parecer menos fluido que com `-NoFboChunk`, apesar de mostrar a cena correta. A comparação de FPS entre os modos (mediana 49 contra 60) foi em sessões diferentes e não é conclusiva.
 - A casa à frente do jogador ainda pode se recolher de perto em algumas situações; o `collapse=player` reduz isso, mas não foi validado em todos os casos.
 - Memória: em 8 GB a RAM livre chegou perto de zero durante o carregamento (54 MB no mundo com som, 6 MB no mínimo da sessão).
@@ -108,7 +120,7 @@ Os testes em `tests/harness/` (Java e PowerShell, um `run-*.ps1` por biblioteca 
 - `ERRO: projectzomboid.jar diverge do manifesto` (saída 3): o jogo foi atualizado depois do `build.ps1`. Rode `.\build.ps1` de novo (a versão do jogo precisa ser a 42.21 compatível com as dylibs).
 - `DLL ausente em dist` (saída 4): rode `.\build.ps1`. `DLL nao e arm64`: não copie DLLs x64 para `dist\`.
 - Janela preta ou fecha na hora: confira o Compatibility Pack e o log mais recente em `logs\game-*.log` (a saída padrão e de erro vão para o fim do arquivo). `-DebugGl` grava diagnóstico de FBO em `logs\fbo-debug.log`.
-- Sprites com textura errada: confira se o `renderfix` efetivo no cabeçalho do log é `flushtex`; teste `-NoFboChunk`.
+- Sprites com textura errada: confira se o `glsync` efetivo no cabeçalho do log é `swapfence,uploadflush,otherflush` (ou `swapfinish`, se você pediu); teste `-NoFboChunk`.
 - Sem som: confira `third-party\fmod` (versão 2.03.09, ARM64) e rode `python -I tools\check_fmod.py`. `-NoSound` desliga.
 - Pouca memória: feche navegador e outros programas; reduza a resolução.
 - Falha de compilação: rode `.\build.ps1 -Clean` e envie a saída em uma issue.

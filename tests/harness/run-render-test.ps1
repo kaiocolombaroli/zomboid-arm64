@@ -1,6 +1,6 @@
 <#
 Testa os hooks renderdiag/renderfix do agente (pzarm-agent.jar) com o RingBuffer.drawElements REAL do jogo num contexto GLFW oculto (ARM64).
-Uso: .\run-render-test.ps1   (rode antes launcher\agent\build.ps1). Roda 11 vezes: sem fix, rebind, uniforms, dirty, dirtyprog, flush, flush64 (flush a cada 64), flushtex, flushchunk, flushtexchunk, collapse (transformacao real de FBORenderCutaways, sem GL).
+Uso: .\run-render-test.ps1   (rode antes launcher\agent\build.ps1). Roda 17 vezes: sem fix, rebind, uniforms, dirty, dirtyprog, flush, flush64 (flush a cada 64), flushtex, flushchunk, flushtexchunk, collapse (transformacao real de FBORenderCutaways, sem GL), vbosync (transformacao real de GLVertexBufferObject e vboAccess, sem GL), uidiag e uimodeldiag (transformacao real de UI3DModel$Drawer, sem GL), glsync (Drawer e Display, sem GL), upload (pontos de insercao de preUpload em todo o jar, sem GL), stutter (stutterdiag: formatos e FBORenderChunk, sem GL).
 Saida: build\render-test\<modo>\render-diag.log. Nada e escrito na pasta do jogo. Codigo de saida != 0 se algum modo falhar.
 #>
 param([string]$GameDir = 'C:\Program Files (x86)\Steam\steamapps\common\ProjectZomboid')
@@ -15,11 +15,17 @@ New-Item -ItemType Directory -Force $Harness | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error 'javac falhou'; exit $LASTEXITCODE }
 $env:PATH = "$Dist;$env:PATH"
 $bad = 0
-foreach ($fix in 'none', 'rebind', 'uniforms', 'dirty', 'dirtyprog', 'flush', 'flush64', 'flushtex', 'flushchunk', 'flushtexchunk', 'collapse') {
+foreach ($fix in 'none', 'rebind', 'uniforms', 'dirty', 'dirtyprog', 'flush', 'flush64', 'flushtex', 'flushchunk', 'flushtexchunk', 'collapse', 'vbosync', 'uidiag', 'uimodeldiag', 'glsync', 'upload', 'stutter') {
     $out = Join-Path $Root "build\render-test\$fix"
     New-Item -ItemType Directory -Force $out | Out-Null
     $agent = "renderdiag,diagevery=1,dir=$out"
     if ($fix -eq 'collapse') { $agent = 'collapse=player' }
+    elseif ($fix -eq 'vbosync') { $agent = 'vbosync=sync' }
+    elseif ($fix -eq 'uidiag') { $agent = "uidiag,dir=$out" }
+    elseif ($fix -eq 'uimodeldiag') { $agent = "uimodeldiag,dir=$out" }
+    elseif ($fix -eq 'glsync') { $agent = "glsync=swapfinish,glsync=modelfinish,dir=$out" }
+    elseif ($fix -eq 'upload') { $agent = "glsync=uploadcount,dir=$out" }
+    elseif ($fix -eq 'stutter') { $agent = "stutterdiag,dir=$out" }
     elseif ($fix -eq 'flush64') { $agent += ",renderfix=flush,flushevery=64" }
     elseif ($fix -ne 'none') { $agent += ",renderfix=$fix" }
     Write-Host "=== modo: $fix"

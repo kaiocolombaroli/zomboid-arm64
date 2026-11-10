@@ -71,16 +71,28 @@ Measured on a single device (Surface Pro X, SQ1, 8 GB, Adreno 680), one short se
 
 | Option | Effect |
 |---|---|
-| (default) | `fboRenderChunk=true`, `renderfix=flushtex` (texture-bug workaround) and `collapse=player` (the house in front does not open up when you are close) |
+| (default) | `fboRenderChunk=true`, `glsync=swapfence,uploadflush,otherflush` (a fence delayed by 1 frame instead of `glFinish`; workaround for a CPU-GPU synchronization hazard in Mesa GLon12) with `vbosync=sync`, no `renderfix`, and `collapse=player` (the house in front does not open up when you are close) |
+| `-GlSync <list>` | CPU-GPU synchronization workaround: default `swapfence,uploadflush,otherflush`; also `swapfinish` (the old `glFinish`, which stalled the CPU; measured cost: median FPS 60 to 37 in one session), `swapflush`, `modelfinish`, `modelflush` etc. (comma-separated list) or `none` (off) |
 | `-NoFboChunk` | back to the old path: `fboRenderChunk=false`, no renderfix, no collapse. It feels smoother |
 | `-NoCollapseFix` | disables only `collapse=player` (the house opens up when close again) |
-| `-RenderFix <mode>` | picks another texture workaround (`none`, `flushtex`, `flush`, `rebind`, `uniforms`, `dirty`, `dirtyprog`, `flushchunk`, `flushtexchunk`); see [docs/RESULTS.md](docs/RESULTS.md) (Portuguese) |
+| `-VboSync <mode>` | workaround for buffers mapped without synchronization (`glMapBufferRange` UNSYNCHRONIZED): `sync` (default; strips UNSYNCHRONIZED), `invalidate` (like `sync` and invalidates the whole buffer) or `none`. The default was validated only in one short session on one machine |
+| `-RenderFix <mode>` | texture workaround, off by default (`none`, `flushtex` restores the old workaround, `flush`, `rebind`, `uniforms`, `dirty`, `dirtyprog`, `flushchunk`, `flushtexchunk`); see [docs/RESULTS.md](docs/RESULTS.md) (Portuguese) |
 | `-NoSound` | play without sound |
 | `-NoAgent` | no Java agent (no rendering adjustments) |
 | `-UseFboChunk` | accepted with no effect (FBO mode is already the default) |
 | `-GameDir`, `-DistDir`, `-CacheDir` | paths; `-Timeout <s>`, `-DryRun`, `-Env`, `-PzSet`, `-RenderDiag`, `-DebugGl` for diagnostics |
 
 The full description is in the header of `launcher\run-game.ps1` (Portuguese).
+
+## Start menu shortcut
+
+`launcher\jogar.ps1` is your launch profile: a configuration block at the top (resolution, FPS cap and the synchronization workarounds) and a call to `run-game.ps1`; extra arguments are passed through (for example `-DryRun`). If the game exits with an error the window waits for Enter so you can read the message. `launcher\jogar.cmd` does the same from Explorer.
+
+`launcher\criar-atalho.ps1` creates (or recreates) the `Project Zomboid ARM64` shortcut in the Start menu, pointing at this repository's `jogar.ps1`:
+
+```powershell
+.\launcher\criar-atalho.ps1
+```
 
 ## Tests
 
@@ -95,7 +107,7 @@ The tests in `tests/harness/` (Java and PowerShell, one `run-*.ps1` per native l
 ## Known limits
 
 - Single player only. No multiplayer and no Steam (the game runs with `-nosteam`; no Workshop or achievements).
-- `flushtex` is a **workaround** for the texture bug (sprites drawn with the wrong texture) on Mesa D3D12, not a Mesa fix. The root cause was not isolated: a standalone reproducer did not reproduce it.
+- The default `glsync` (`swapfence,uploadflush,otherflush` + `vbosync=sync`) is a **workaround**, not a Mesa fix. The likely cause is a CPU-GPU synchronization hazard in Mesa GLon12/D3D12 (emulated x64 suffers too): sprites drawn with the wrong texture and the menu character vanishing. The `uimodeldiag` diagnostic showed the game draws every frame and that forcing synchronization fixes it. The default replaces `glFinish` (which drained the GPU and stalled the CPU) with a fence delayed by 1 frame, keeping CPU and GPU in parallel; `vbosync=sync` and the upload flushes prevent the texture corruption that the fence alone lets come back. Validated in game (clean image, FPS "better") only in one short session on one machine, with no controlled comparison. `-GlSync swapfinish` goes back to the old `glFinish` (measured cost: median FPS from 60 to 37 in one session). A standalone pure-OpenGL reproducer did not reproduce the problem.
 - In FBO mode (the default) the game can feel less smooth than with `-NoFboChunk`, although it shows the scene correctly. The FPS comparison between the modes (median 49 versus 60) came from different sessions and is not conclusive.
 - The house in front of the player may still collapse when you are close in some situations; `collapse=player` reduces this but was not validated in every case.
 - Memory: on 8 GB free RAM got close to zero while loading (54 MB in the world with sound, 6 MB at the session minimum).
@@ -108,7 +120,7 @@ The tests in `tests/harness/` (Java and PowerShell, one `run-*.ps1` per native l
 - `ERRO: projectzomboid.jar diverge do manifesto` (exit 3): the game was updated after `build.ps1`. Run `.\build.ps1` again (the game version must be the 42.21 compatible with the dylibs).
 - `DLL ausente em dist` (exit 4): run `.\build.ps1`. `DLL nao e arm64`: do not copy x64 DLLs into `dist\`.
 - Black window or immediate exit: check the Compatibility Pack and the latest `logs\game-*.log` (standard output and error are appended at the end of the file). `-DebugGl` writes FBO diagnostics to `logs\fbo-debug.log`.
-- Wrong sprite textures: check that the effective `renderfix` in the log header is `flushtex`; try `-NoFboChunk`.
+- Wrong sprite textures: check that the effective `glsync` in the log header is `swapfence,uploadflush,otherflush` (or `swapfinish`, if you asked for it); try `-NoFboChunk`.
 - No sound: check `third-party\fmod` (version 2.03.09, ARM64) and run `python -I tools\check_fmod.py`. `-NoSound` turns sound off.
 - Low memory: close the browser and other programs; lower the resolution.
 - Build failure: run `.\build.ps1 -Clean` and attach the output to an issue.

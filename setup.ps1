@@ -143,7 +143,9 @@ if (-not $haveNat -and (Net "LWJGL $LwjglVer natives windows-arm64 (Maven Centra
         if ($got -ne $want) { throw "SHA-1 do $name nao confere com o Maven Central" }
         $x = Join-Path $dl "x-$mod"
         if (Test-Path $x) { Remove-Item -Recurse -Force $x }
-        Expand-Archive -LiteralPath $f -DestinationPath $x
+        $z = "$f.zip"; Copy-Item -LiteralPath $f $z -Force
+        Expand-Archive -LiteralPath $z -DestinationPath $x
+        Remove-Item -LiteralPath $z -Force
         Get-ChildItem $x -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName (Join-Path $natives $_.Name) -Force }
         Remove-Item -Recurse -Force $x
     }
